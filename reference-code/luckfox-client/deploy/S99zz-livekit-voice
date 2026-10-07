@@ -1,0 +1,27 @@
+#!/bin/sh
+
+RUNNER=/root/run-luckfox-livekit.sh
+PID_FILE=/var/run/luckfox-livekit.pid
+
+case "$1" in
+    start)
+        echo "Starting Luckfox LiveKit voice client"
+        start-stop-daemon -S -q -b -m -p "$PID_FILE" -x "$RUNNER"
+        ;;
+    stop)
+        echo "Stopping Luckfox LiveKit voice client"
+        start-stop-daemon -K -q -o -p "$PID_FILE"
+        rm -f "$PID_FILE"
+        ;;
+    restart)
+        "$0" stop
+        sleep 1
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+exit 0

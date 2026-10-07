@@ -1,0 +1,48 @@
+diff --git a/vendor/github.com/livekit/media-sdk/resample_nocgo.go b/vendor/github.com/livekit/media-sdk/resample_nocgo.go
+--- a/vendor/github.com/livekit/media-sdk/resample_nocgo.go
++++ b/vendor/github.com/livekit/media-sdk/resample_nocgo.go
+@@ -1,4 +1,4 @@
+-//go:build !cgo
++//go:build !cgo || nosoxr
+ 
+ package media
+ 
+diff --git a/vendor/github.com/livekit/media-sdk/resample_soxr.go b/vendor/github.com/livekit/media-sdk/resample_soxr.go
+--- a/vendor/github.com/livekit/media-sdk/resample_soxr.go
++++ b/vendor/github.com/livekit/media-sdk/resample_soxr.go
+@@ -1,4 +1,4 @@
+-//go:build cgo
++//go:build cgo && !nosoxr
+ 
+ // Copyright 2024 LiveKit, Inc.
+ //
+diff --git a/vendor/github.com/livekit/server-sdk-go/v2/pkg/media/pcmlocaltrack.go b/vendor/github.com/livekit/server-sdk-go/v2/pkg/media/pcmlocaltrack.go
+--- a/vendor/github.com/livekit/server-sdk-go/v2/pkg/media/pcmlocaltrack.go
++++ b/vendor/github.com/livekit/server-sdk-go/v2/pkg/media/pcmlocaltrack.go
+@@ -45,6 +45,9 @@ func WithHWStats() PCMLocalTrackOption {
+ }
+ 
+ type PCMLocalTrack struct {
++	// Keep 64-bit atomics first so they are 8-byte aligned on 32-bit ARM.
++	numSamples atomic.Int64
++
+ 	*webrtc.TrackLocalStaticSample
+ 
+ 	opusWriter         media.WriteCloser[opus.Sample]
+@@ -59,7 +62,6 @@ type PCMLocalTrack struct {
+ 	// int16 to support a LE/BE PCM16 chunk that has a high byte and low byte
+ 	// TODO(anunaym14): switch out deque for a ring buffer
+ 	chunkBuffer *deque.Deque[media.PCM16Sample]
+-	numSamples  atomic.Int64
+ 
+ 	mu   sync.Mutex
+ 	cond *sync.Cond
+@@ -157,7 +159,7 @@ func NewPCMLocalTrack(
+ 		frameDuration:          defaultPCMFrameDuration,
+ 		sourceChannels:         sourceChannels,
+ 		chunkBuffer:            new(deque.Deque[media.PCM16Sample]),
+-		samplesPerFrame:        (sourceSampleRate * sourceChannels * int(defaultPCMFrameDuration/time.Nanosecond)) / 1e9,
++		samplesPerFrame:        int((int64(sourceSampleRate) * int64(sourceChannels) * int64(defaultPCMFrameDuration)) / int64(time.Second)),
+ 		logger:                 logger,
+ 		enableStats:            params.EnableStats,
+ 		loggingEnabled:         params.EnableStats || params.EnableHWStats,

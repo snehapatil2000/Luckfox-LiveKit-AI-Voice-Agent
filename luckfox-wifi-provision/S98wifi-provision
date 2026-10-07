@@ -1,0 +1,59 @@
+#!/bin/sh
+
+DAEMON=/opt/luckfox-wifi-provision/provision-supervisor.sh
+PIDFILE=/var/run/luckfox-wifi-provision.pid
+
+start() {
+    printf 'Starting Luckfox Bluetooth Wi-Fi provisioning: '
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        echo "already running"
+        return 0
+    fi
+    start-stop-daemon -S -q -m -b -p "$PIDFILE" -x /bin/sh -- "$DAEMON"
+    status=$?
+    [ "$status" -eq 0 ] && echo "OK" || echo "FAIL"
+    return "$status"
+}
+
+stop() {
+    printf 'Stopping Luckfox Bluetooth Wi-Fi provisioning: '
+    start-stop-daemon -K -q -p "$PIDFILE"
+    status=$?
+    rm -f "$PIDFILE"
+    # The supervisor is a shell script, so start-stop-daemon may leave
+    # older instances behind after a restart. Kill every exact supervisor
+    # command before releasing RFCOMM, otherwise channel 4 remains occupied.
+    for proc_dir in /proc/[0-9]*; do
+        [ -r "$proc_dir/cmdline" ] || continue
+        cmdline=$(tr '\000' ' ' < "$proc_dir/cmdline" 2>/dev/null || true)
+        case "$cmdline" in
+            *"/opt/luckfox-wifi-provision/provision-supervisor.sh"*)
+                kill "${proc_dir##*/}" >/dev/null 2>&1 || true
+                ;;
+        esac
+    done
+    sleep 1
+    killall rfcomm >/dev/null 2>&1 || true
+    rfcomm release /dev/rfcomm0 >/dev/null 2>&1 || true
+    if [ -f /var/run/luckfox-bt-agent.pid ]; then
+        kill "$(cat /var/run/luckfox-bt-agent.pid)" >/dev/null 2>&1 || true
+        rm -f /var/run/luckfox-bt-agent.pid
+    fi
+    [ "$status" -eq 0 ] && echo "OK" || echo "not running"
+    return 0
+}
+
+case "${1:-}" in
+    start) start ;;
+    stop) stop ;;
+    restart) stop; sleep 1; start ;;
+    status)
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+            echo "running (PID $(cat "$PIDFILE"))"
+        else
+            echo "stopped"
+            exit 1
+        fi
+        ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

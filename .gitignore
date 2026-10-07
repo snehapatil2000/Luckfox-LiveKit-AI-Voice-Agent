@@ -1,0 +1,39 @@
+# Local secrets and machine-specific configuration
+.env
+.env.*
+!.env.example
+**/luckfox-livekit.env
+**/*.pem
+**/*.key
+**/*.p12
+
+# Python
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
+**/*.py[cod]
+**/*.egg-info/
+
+# Go build cache and generated native build output
+reference-code/luckfox-client/.gocache/
+reference-code/luckfox-client/opus-armv7/
+reference-code/luckfox-client/third_party/opus-1.5.2/
+
+# Android/Gradle generated output
+luckfox-wifi-provision-app/.gradle/
+luckfox-wifi-provision-app/**/build/
+luckfox-wifi-provision-app/local.properties
+
+# Runtime and temporary files
+*.log
+*.pid
+*.tmp
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local packaged copies; build from the tracked sources instead
+*.apk
+*.aab
