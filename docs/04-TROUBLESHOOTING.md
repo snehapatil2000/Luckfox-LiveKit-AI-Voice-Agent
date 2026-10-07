@@ -1,162 +1,103 @@
 # Troubleshooting
 
-Use these checks in order.
+Run these checks in order.
 
-## 1. No answer
+## No voice answer
 
-Confirm the command begins with the wake word:
+Every question must begin clearly with `Hey Siri`. Check that the board is
+connected and the remote audio track is subscribed:
+
+```sh
+pidof luckfox-livekit-client
+tail -n 80 /root/luckfox-livekit.log
+```
+
+Look for `Connected`, `Microphone is live`, and `Receiving voice from`.
+
+## Wake phrase is ignored
+
+Speak close to the board microphone and use one sentence:
 
 ```text
-Agent, what is the capital of India?
+Hey Siri, what is the time?
 ```
 
-Speech without `Agent` is intentionally ignored.
+Background noise, clipping, distance, or STT transcription errors can remove
+the wake phrase. Cloud logs show the transcript that the gate received.
 
-## 2. `room session transport is closed`
+## Reply stops or repeats
 
-Example:
+The speaker may be feeding audio back into the nearby microphone. The agent
+contains echo rejection and disables ordinary acoustic interruption. Keep the
+speaker volume moderate, move it away from the microphone, or use headphones.
+Only an explicit `Hey Siri` command should interrupt a response.
 
-```text
-RuntimeError: room session transport is closed
-job exiting {"reason": "room disconnected"}
+## Slow response
+
+Compare cloud timestamps for `VOICE USER`, `thinking`, the Sarvam WebSocket,
+and `speaking`. Normal processing includes STT endpointing, DeepSeek, Sarvam
+TTS, and network transport. Delays of tens of seconds usually indicate an
+unstable network or a provider reconnect rather than local CPU processing.
+
+## DNS timeout or no route
+
+```sh
+wpa_cli -i wlan0 status
+ip route
+cat /etc/resolv.conf
+ping -I wlan0 -c 2 8.8.8.8
 ```
 
-Meaning:
+Renew Wi-Fi DHCP if needed:
 
-- The individual LiveKit room disconnected.
-- It is normally not a Python crash.
-- The main PC worker can still be registered and waiting for another room.
-- The Luckfox connection may be stale after a temporary network interruption.
+```sh
+udhcpc -i wlan0 -n -q -t 10
+```
 
-Recovery without rebuilding:
+Use only one working default route. If Ethernet has no internet but owns the
+default route, disconnect it or remove that route. DNS lookup must work before
+restarting the voice service.
+
+## Sarvam credits exhausted
+
+Cloud logs show close code `1003` and `Credits exhausted`. Add Sarvam credits,
+confirm `SARVAM_API_KEY`, and restart or redeploy the cloud worker.
+
+## Cloud deployment inactive
+
+`The agent has shut down due to inactivity` is expected when no board room is
+active. Restart the board service, wait for a new room, and reconnect the log
+viewer.
+
+## ADB offline
 
 ```powershell
-cd "C:\Users\sneha\OneDrive\Documents\PROJECTS\AI VOICE AGENT\Livekit-Deepseek-Deepgram\Luckfox-LiveKit-AI-Voice-Agent-With-PC\scripts"
-powershell -ExecutionPolicy Bypass -File .\restart_luckfox_voice.ps1
+adb kill-server
+adb start-server
+adb devices
 ```
 
-Wait for a new `received job request` and `VOICE STATE: listening` line.
+ADB is not needed for normal voice operation. Use Ethernet/SSH if USB ADB is
+temporarily unavailable.
 
-## 3. Board service and process checks
+## Check board configuration
+
+```sh
+grep -E '^(LIVEKIT_URL|LIVEKIT_AGENT_NAME|CAPTURE_DEVICE|PLAYBACK_DEVICE)=' /root/luckfox-livekit.env
+```
+
+The cloud worker name must be `my-agent`. Do not print the API secret.
+
+## Validate Python changes
 
 ```powershell
-ssh root@192.168.0.106
-```
-
-```sh
-cat /var/run/luckfox-livekit.pid
-ps -ef | grep -E 'run-luckfox-livekit|luckfox-livekit-client|arecord|aplay' | grep -v grep
-tail -n 100 /root/luckfox-livekit.log
-```
-
-On this BusyBox board, `pidof luckfox-livekit-client` may not always show the full picture. `ps -ef` is preferred.
-
-## 4. Wrong agent selected
-
-Check:
-
-```sh
-grep '^LIVEKIT_AGENT_NAME=' /root/luckfox-livekit.env
-```
-
-PC mode must show:
-
-```text
-LIVEKIT_AGENT_NAME=my-agent-local
-```
-
-Correct it:
-
-```sh
-/root/use-pc-agent.sh
-```
-
-## 5. Microphone unavailable
-
-Stop the service and test ALSA:
-
-```sh
-/etc/init.d/S99zz-livekit-voice stop
-arecord -D hw:0,0 -f S16_LE -r 48000 -c 2 -d 5 /tmp/mic-test.wav
-aplay -D hw:0,0 /tmp/mic-test.wav
-/etc/init.d/S99zz-livekit-voice start
-```
-
-Also check for another recorder:
-
-```sh
-ps -ef | grep arecord | grep -v grep
-```
-
-## 6. Agent registered but no room job
-
-Restart the board service:
-
-```sh
-/etc/init.d/S99zz-livekit-voice restart
-```
-
-This creates a fresh room and dispatches `my-agent-local` again.
-
-## 7. DeepSeek does not answer
-
-Check:
-
-- `DEEPSEEK_API_KEY` exists in the PC `.env.local`.
-- The DeepSeek account has credit.
-- The model name is `deepseek-v4-flash`.
-- The PC has internet access.
-
-Do not print or share the key.
-
-## 8. Deepgram STT or TTS does not connect
-
-Check:
-
-- `DEEPGRAM_API_KEY` exists in `.env.local`.
-- The Deepgram account has credit.
-- Logs show both STT and TTS WebSocket connections.
-- Models are `nova-3` and `aura-2-andromeda-en`.
-
-## 9. Old Deepgram constructor error
-
-Do not use:
-
-```python
-deepgram.TTS(model="aura-2", voice="athena")
-```
-
-Use:
-
-```python
-deepgram.TTS(model="aura-2-andromeda-en")
-```
-
-## 10. Python indentation or syntax error
-
-```powershell
-cd "$env:USERPROFILE\Downloads\agent-server"
+cd reference-code\agent-server
 uv run python -m py_compile src\agent.py
-uv run ruff check src\agent.py
+uv run ruff check src\agent.py tests
+uv run pytest
 ```
 
-## 11. Harmless board warnings
+## Harmless board warnings
 
-These warnings are normally harmless when later logs show `Connected`:
-
-```text
-Failed to enable mDNS over IPv6
-Failed to ping without candidate pairs
-```
-
-The Luckfox kernel does not have IPv6 enabled, but IPv4 connectivity succeeds.
-
-## 12. IP changed
-
-Find the board's new DHCP address and use it:
-
-```powershell
-ssh root@NEW_IP
-powershell -ExecutionPolicy Bypass -File .\run_with_pc_demo.ps1 -BoardIP NEW_IP
-```
-
+IPv6/mDNS and early ICE candidate warnings are normally harmless if later
+lines show `Connected`.

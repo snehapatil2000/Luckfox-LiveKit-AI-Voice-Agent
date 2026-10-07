@@ -1,5 +1,6 @@
 param(
-    [string]$BoardIP = "192.168.0.106",
+    [Parameter(Mandatory = $true)]
+    [string]$BoardIP,
     [string]$BinaryPath = ""
 )
 
@@ -54,4 +55,3 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "Deployment completed." -ForegroundColor Green
 Write-Host "If CONFIG_REQUIRED appeared, configure /root/luckfox-livekit.env and restart the service."
-

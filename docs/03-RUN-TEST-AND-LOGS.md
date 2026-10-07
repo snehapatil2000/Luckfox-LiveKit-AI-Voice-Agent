@@ -1,137 +1,93 @@
 # Run, Test, and Show Logs
 
-## Start the full PC demonstration
+## Start or restart the board client
 
-Open PowerShell:
-
-```powershell
-cd "C:\Users\sneha\OneDrive\Documents\PROJECTS\AI VOICE AGENT\Livekit-Deepseek-Deepgram\Luckfox-LiveKit-AI-Voice-Agent-With-PC\scripts"
-powershell -ExecutionPolicy Bypass -File .\run_with_pc_demo.ps1
-```
-
-The default values are:
-
-```text
-BoardIP: 192.168.0.106
-AgentDirectory: C:\Users\sneha\Downloads\agent-server
-AgentName: my-agent-local
-```
-
-Override the board IP if DHCP changes it:
+Using ADB:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\run_with_pc_demo.ps1 -BoardIP 192.168.0.120
+adb devices
+adb -s <board-serial> shell /etc/init.d/S99zz-livekit-voice restart
+adb -s <board-serial> shell "tail -f /root/luckfox-livekit.log"
 ```
 
-## Correct startup logs
-
-```text
-starting worker
-registered worker ... "agent_name": "my-agent-local"
-received job request
-Established new Deepgram STT WebSocket connection
-Established new Deepgram TTS WebSocket connection
-VOICE STATE: listening
-```
-
-## Voice tests
-
-Test wake-word blocking:
-
-```text
-What is the capital of India?
-```
-
-Expected: no answer. Log:
-
-```text
-WAKE WORD: ignored speech without Agent
-```
-
-Test normal AI:
-
-```text
-Agent, what is the capital of India?
-```
-
-Expected:
-
-```text
-VOICE USER: what is the capital of India?
-VOICE STATE: thinking
-VOICE STATE: speaking
-VOICE ASSISTANT: The capital of India is New Delhi.
-VOICE STATE: listening
-```
-
-Test the clock:
-
-```text
-Agent, what time is it?
-```
-
-Expected:
-
-```text
-CLOCK: The current time in India is ...
-VOICE ASSISTANT: The current time in India is ...
-```
-
-Test two-step wake mode:
-
-```text
-Agent
-```
-
-Expected answer: `Yes, I'm listening.` Ask the command within ten seconds.
-
-## Open board logs in another PowerShell window
+Using SSH:
 
 ```powershell
-cd "C:\Users\sneha\OneDrive\Documents\PROJECTS\AI VOICE AGENT\Livekit-Deepseek-Deepgram\Luckfox-LiveKit-AI-Voice-Agent-With-PC\scripts"
-powershell -ExecutionPolicy Bypass -File .\show_luckfox_logs.ps1
+ssh root@<board-ip> "/etc/init.d/S99zz-livekit-voice restart"
+ssh root@<board-ip> "tail -f /root/luckfox-livekit.log"
 ```
 
-Stop continuous logs with `Ctrl+C`.
+Board logs prove transport and audio state. They do not show full user and
+assistant transcripts.
 
-## Development tmux logs
+## Follow LiveKit Cloud logs
 
-When using the existing WSL tmux session:
-
-```bash
-tmux attach -t 0
+```powershell
+lk agent logs --id <cloud-agent-id> --project <project-name> --log-type deploy
 ```
 
-The PC agent is shown in:
+Useful entries:
 
 ```text
-pane 0:0.1
+VOICE USER: ...
+VOICE ASSISTANT: ...
+VOICE STATE: listening|thinking|speaking
+WAKE WORD: ...
+WAKE BARGE-IN: ...
+TOOL CALL: ...
+TOOL RESULT: ...
+Starting TTS WebSocket session
+WebSocket session completed successfully
 ```
 
-Capture recent output without attaching:
+`The agent has shut down due to inactivity` means there is no active room.
+Restart the board voice service to create a room, then run the log command
+again. `scanner error` is a log-stream connection failure; rerun the command.
+
+## WSL tmux pane
+
+If logs are displayed in pane `0:0.1`:
 
 ```bash
 tmux capture-pane -p -t 0:0.1 -S -120
+tmux attach -t 0
 ```
 
-The reusable PowerShell script is easier for a future instructor demonstration and does not require tmux.
+The pane normally runs the LiveKit CLI command above, not ADB. Use ADB only
+for `/root/luckfox-livekit.log`.
 
-## Stop
+## Voice tests
 
-Press `Ctrl+C` in the PowerShell window running `run_with_pc_demo.ps1`.
+English:
 
-The board service may remain connected and wait for `my-agent-local`. To stop it too:
-
-```powershell
-ssh root@192.168.0.106 "/etc/init.d/S99zz-livekit-voice stop"
+```text
+Hey Siri, what is the capital of India?
+Hey Siri, what time is it?
+Hey Siri, what is the weather in Bengaluru?
 ```
 
-## Restart only the existing board service
+Kannada:
 
-No build or deployment is required:
-
-```powershell
-cd "C:\Users\sneha\OneDrive\Documents\PROJECTS\AI VOICE AGENT\Livekit-Deepseek-Deepgram\Luckfox-LiveKit-AI-Voice-Agent-With-PC\scripts"
-powershell -ExecutionPolicy Bypass -File .\restart_luckfox_voice.ps1
+```text
+Hey Siri, ಕರ್ನಾಟಕದ ಜಿಲ್ಲೆಗಳನ್ನು ಹೇಳು.
+Hey Siri, ಭಾರತದ ರಾಜ್ಯಗಳನ್ನು ಹೇಳು.
 ```
 
+Wake-word rejection:
+
+```text
+What is the time?
+```
+
+Expected: no answer and `WAKE WORD: ignored speech without Hey Siri`.
+
+Barge-in:
+
+1. Ask for a story or a list.
+2. While the assistant speaks, say `Hey Siri, what is the time?`.
+3. The previous audio should stop and the new answer should begin.
+
+## Stop continuous logs
+
+Press `Ctrl+C`. This stops only the log viewer; it does not stop the board or
+cloud agent.

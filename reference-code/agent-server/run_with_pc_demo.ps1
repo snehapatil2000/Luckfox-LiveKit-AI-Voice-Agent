@@ -1,5 +1,6 @@
 param(
-    [string]$BoardIP = "192.168.1.106"
+    [Parameter(Mandatory = $true)]
+    [string]$BoardIP
 )
 
 $ErrorActionPreference = "Stop"

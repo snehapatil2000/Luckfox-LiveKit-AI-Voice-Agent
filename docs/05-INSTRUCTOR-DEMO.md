@@ -1,69 +1,99 @@
-# Simple Instructor Demonstration
+# Instructor Demonstration
 
-## Start the demonstration
+## Introduction
 
-Show the Luckfox and say:
+> “This is my bilingual AI voice agent built with a Luckfox Pico Pi A W. The
+> board captures my voice and plays the response. LiveKit Cloud transports the
+> live audio and runs my Python script.”
 
-> “This is the Luckfox Pico Pi A W. Its microphone captures my voice, and its speaker or headphones play the AI response.”
+## Architecture explanation
 
-Open PowerShell and run:
+> “First, the Luckfox microphone sends audio through LiveKit Cloud. Sarvam
+> Saaras converts English or Kannada speech into text. DeepSeek understands
+> the question and generates the answer. Sarvam Bulbul converts the answer
+> into English or Kannada voice. LiveKit sends that voice back to the Luckfox
+> speaker or headphones.”
+
+## Start the demo
+
+Restart the board service if necessary:
 
 ```powershell
-cd "C:\Users\sneha\OneDrive\Documents\PROJECTS\AI VOICE AGENT\Livekit-Deepseek-Deepgram\Luckfox-LiveKit-AI-Voice-Agent-With-PC"
-powershell -ExecutionPolicy Bypass -File .\START-WITH-PC-DEMO.ps1
+adb -s <board-serial> shell /etc/init.d/S99zz-livekit-voice restart
+```
+
+Open LiveKit Cloud logs in another terminal:
+
+```powershell
+lk agent logs --id <cloud-agent-id> --project <project-name> --log-type deploy
+```
+
+Wait until the board log says `Microphone is live` and cloud logs show
+`VOICE STATE: listening`.
+
+## Demonstration questions
+
+```text
+Hey Siri, what time is it?
+Hey Siri, tell me the districts of Karnataka.
+Hey Siri, ಕರ್ನಾಟಕದ ಜಿಲ್ಲೆಗಳನ್ನು ಹೇಳು.
+```
+
+For barge-in, ask for a story and interrupt it with:
+
+```text
+Hey Siri, what is the weather in Bengaluru?
 ```
 
 Say:
 
-> “This script selects PC mode on the Luckfox and starts my Python LiveKit agent on Windows. The PC must stay on in this mode.”
+> “This feature is called wake-word barge-in or interruption handling. LiveKit
+> detects speech, but the Python script interrupts only when the final
+> transcript contains Hey Siri. This prevents speaker echo from stopping the
+> answer.”
 
-When `VOICE STATE: listening` appears, say:
+## Common questions and answers
 
-> “The Luckfox is now connected to a LiveKit Cloud room and is streaming microphone audio through the internet.”
+**What does LiveKit do?**
 
-Ask near the board:
+> “LiveKit provides the real-time room, transports audio in both directions,
+> dispatches the worker, and hosts my deployed Python agent. It is not the
+> language model.”
 
-> “Agent, what is the capital of India?”
+**What is the Python voice agent?**
 
-Point to the logs and say:
+> “It is the script that connects STT, DeepSeek, TTS, wake-word logic, tools,
+> turn detection, interruption handling, and logs.”
 
-> “Deepgram converts my live speech into text. The wake word is Agent, so speech without that word is ignored. DeepSeek is the LLM that understands the question and generates the answer. Deepgram then converts that answer into voice. LiveKit sends the voice back to the Luckfox speaker.”
+**Does the PC have to remain connected?**
 
-Ask:
+> “No. The normal agent runs in LiveKit Cloud. The board needs power, audio,
+> Wi-Fi, and internet. I use the PC only for development and logs.”
 
-> “Agent, what time is it?”
+**What are STT, LLM, and TTS?**
 
-Say:
+> “STT converts speech to text, the LLM generates the answer, and TTS converts
+> the answer back into speech.”
 
-> “Time questions are handled by the Python program using India Standard Time, so the LLM does not guess the current time.”
+**What logs are shown?**
 
-## Short architecture explanation
+> “The transcript logs come from the Python agent in LiveKit Cloud. Board logs
+> show audio tracks and the network connection but not the complete question
+> and answer text.”
 
-> “I use LiveKit Cloud as the real-time communication server. My Python AI agent runs on this Windows PC. Deepgram provides speech-to-text and text-to-speech. DeepSeek provides the large language model. The Luckfox handles the microphone and speaker.”
+**What remains unfinished?**
 
-## If asked whether it is local or cloud
-
-> “It is an internet/cloud voice system with the Python agent running locally on my Windows PC. LiveKit, Deepgram, and DeepSeek are cloud services. Therefore, both the PC and internet are required.”
-
-## If asked what LiveKit does
-
-> “LiveKit creates a real-time room and transports the live microphone and reply audio. It is not the LLM. DeepSeek is the LLM.”
-
-## If asked what an LLM is
-
-> “LLM means Large Language Model. It understands the user's text question and generates a suitable text answer. I use DeepSeek V4 Flash.”
-
-## If asked how this differs from the old WAV design
-
-> “The old design recorded a complete WAV file, transferred it, processed it, and transferred a reply file. The current LiveKit design streams audio continuously, so processing can begin sooner and the conversation feels more real time.”
+> “Bluetooth Wi-Fi provisioning and GPIO push-to-talk are experimental. The
+> demonstrated voice path and automatic board startup are working.”
 
 ## Services summary
 
 ```text
-Microphone and speaker: Luckfox
-Audio server: LiveKit Cloud
-Agent/orchestration: Python on Windows PC
-Speech-to-text: Deepgram Nova-3
-Answer generation: DeepSeek V4 Flash
-Text-to-speech: Deepgram Aura-2
+Hardware audio: Luckfox Pico Pi A W
+Real-time transport and agent hosting: LiveKit Cloud
+Speech-to-text: Sarvam Saaras v4
+Language model: DeepSeek V4 Flash
+Text-to-speech: Sarvam Bulbul v3
+Wake phrase: Hey Siri
+Interruption: explicit wake-word barge-in
 ```

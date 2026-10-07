@@ -1,95 +1,72 @@
 # File Map and Security
 
-## Package contents
+## Important files
 
 ```text
-Luckfox-LiveKit-AI-Voice-Agent-With-PC/
-├── README.md
-├── START-WITH-PC-DEMO.ps1
-├── DEPLOY-TO-LUCKFOX.ps1
-├── docs/
-│   ├── 01-FULL-PROJECT-WORKFLOW.md
-│   ├── 02-BUILD-AND-DEPLOY.md
-│   ├── 03-RUN-TEST-AND-LOGS.md
-│   ├── 04-TROUBLESHOOTING.md
-│   ├── 05-INSTRUCTOR-DEMO.md
-│   └── 06-FILE-MAP-AND-SECURITY.md
-├── scripts/
-│   ├── build_luckfox_client.sh
-│   ├── deploy_luckfox_with_pc.ps1
-│   ├── restart_luckfox_voice.ps1
-│   ├── run_with_pc_demo.ps1
-│   └── show_luckfox_logs.ps1
-└── reference-code/
-    ├── agent-server/
-    │   ├── .env.example
-    │   ├── pyproject.toml
-    │   ├── uv.lock
-    │   └── src/agent.py
-    └── luckfox-client/
-        ├── main.go
-        ├── go.mod
-        ├── go.sum
-        ├── livekit-armv7.patch
-        └── deploy/
+README.md
+DEPLOY-FRESH-LUCKFOX.ps1
+docs/
+reference-code/agent-server/
+├── .env.example
+├── Dockerfile
+├── pyproject.toml
+├── uv.lock
+├── src/agent.py
+└── tests/
+reference-code/luckfox-client/
+├── main.go
+├── build/luckfox-livekit-client
+└── deploy/
+    ├── S99zz-livekit-voice
+    ├── run-luckfox-livekit.sh
+    └── luckfox-livekit.env.example
+luckfox-wifi-provision/             experimental
+luckfox-wifi-provision-app/         experimental
+docs/07-GPIO-PUSH-TO-TALK.md        planned hardware trigger
 ```
 
-`START-WITH-PC-DEMO.ps1` is the main instructor demonstration command. `DEPLOY-TO-LUCKFOX.ps1` is needed only for a fresh board or a client reinstall.
-
-
-## Working files on Windows
-
-```text
-C:\Users\sneha\Downloads\agent-server\src\agent.py
-C:\Users\sneha\Downloads\agent-server\.env.local
-C:\Users\sneha\Downloads\agent-server\pyproject.toml
-```
-
-## Installed files on Luckfox
+## Installed board files
 
 ```text
 /root/luckfox-livekit-client
 /root/luckfox-livekit.env
 /root/run-luckfox-livekit.sh
-/root/use-pc-agent.sh
 /etc/init.d/S99zz-livekit-voice
 /root/luckfox-livekit.log
 ```
 
-## Credential placement
+## Secret placement
 
-| Secret | PC `.env.local` | Luckfox prototype | Documentation/Git |
-|---|---:|---:|---:|
-| LiveKit URL | Yes | Yes | URL may be documented |
-| LiveKit API key | Yes | Yes | Never |
-| LiveKit API secret | Yes | Yes | Never |
-| DeepSeek key | Yes | No | Never |
-| Deepgram key | Yes | No | Never |
+| Value | Local `.env.local` | LiveKit deployment secret | Board | Git |
+|---|---:|---:|---:|---:|
+| LiveKit URL | Yes | Yes | Yes | Placeholder only |
+| LiveKit API key/secret | Yes | Yes | Prototype only | Never |
+| DeepSeek key | Yes | Yes | No | Never |
+| Sarvam key | Yes | Yes | No | Never |
+| Deepgram fallback key | Optional | Optional | No | Never |
 
-The board stores LiveKit API credentials only because this prototype creates its own room token and dispatch. Protect the file:
+Protect the board environment:
 
 ```sh
 chmod 600 /root/luckfox-livekit.env
 ```
 
-For production, do not permanently store the LiveKit API secret on an embedded device. Use a trusted HTTPS token server that gives the board a short-lived participant token.
+Production hardware should not permanently hold a LiveKit API secret. A
+trusted token service should issue short-lived participant tokens.
 
-## Before committing to Git
+## Before every commit
 
-Verify that secrets are not staged:
-
-```powershell
-git status
+```bash
+git status --short
 git diff --cached
+git ls-files | rg -i '(^|/)(\.env($|\.)|.*secret.*|.*\.pem$|.*\.key$)'
 ```
 
-Recommended `.gitignore` entries:
+Tracked `.env.example` files must contain only empty values or obvious
+placeholders. Never paste credentials into documentation, screenshots, logs,
+issues, or commits.
 
-```gitignore
-.env
-.env.*
-!.env.example
-*.key
-*.pem
-luckfox-livekit.env
-```
+The repository includes a prebuilt ARM binary and vendored Go dependencies so
+the embedded client can be reproduced in the tested environment. Generated
+Android build output, local virtual environments, logs, and credentials are
+ignored.

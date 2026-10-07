@@ -1,38 +1,28 @@
-# Build and Deploy the Luckfox Client
+# Build and Deploy
 
-Use this document for a new Luckfox board or when rebuilding the Go audio client. For an already-installed demonstration, skip this document and run `scripts/run_with_pc_demo.ps1`.
+Use this guide for a new board or after changing the Go audio client. Replace
+`<board-ip>` with the board's current DHCP address; do not hard-code a private
+address because it can change after rebooting or changing networks.
 
-## 1. Verify the board
-
-From PowerShell:
+## Check the board
 
 ```powershell
-ssh root@192.168.0.106
+ssh root@<board-ip>
 ```
-
-Run on Luckfox:
 
 ```sh
 uname -m
-python3 --version
-ldd /bin/sh 2>&1 | head -1
 arecord -l
 aplay -l
-df -h
+ip address
+ip route
+cat /etc/resolv.conf
 ```
 
-Expected important values:
+The supplied binary targets ARMv7 with uClibc. The tested capture and playback
+device is `hw:0,0` at 48 kHz.
 
-```text
-armv7l
-libc.so.0 => /lib/libc.so.0
-capture card 0, device 0
-playback card 0, device 0
-```
-
-## 2. Test the board audio first
-
-Stop the LiveKit client before taking the ALSA device:
+## Test audio before deployment
 
 ```sh
 /etc/init.d/S99zz-livekit-voice stop 2>/dev/null || true
@@ -40,39 +30,12 @@ arecord -D hw:0,0 -f S16_LE -r 48000 -c 2 -d 5 /tmp/mic-test.wav
 aplay -D hw:0,0 /tmp/mic-test.wav
 ```
 
-Speak during the five-second recording. Continue only if your voice plays correctly.
+## Build the ARM client
 
-## 3. Prepare WSL build requirements
-
-The tested build uses:
-
-```text
-Go: /home/sneha/agent/toolchains/go/bin/go
-Cross GCC prefix:
-/home/sneha/luckfox-pico-sdk/tools/linux/toolchain/
-arm-rockchip830-linux-uclibcgnueabihf/bin/
-arm-rockchip830-linux-uclibcgnueabihf-
-```
-
-Required Ubuntu utilities include `curl`, `tar`, `make`, `patch`, and `pkg-config`.
-
-The build script downloads and builds Opus 1.5.2 if the static ARM library is missing. It then downloads Go modules, creates `vendor`, applies `livekit-armv7.patch`, and builds an ARMv7/uClibc binary.
-
-## 4. Run the build script
-
-From WSL:
+From WSL at the repository root:
 
 ```bash
-cd "/mnt/c/Users/sneha/OneDrive/Documents/PROJECTS/AI VOICE AGENT/Livekit-Deepseek-Deepgram/Luckfox-LiveKit-AI-Voice-Agent-With-PC"
 chmod +x scripts/build_luckfox_client.sh
-./scripts/build_luckfox_client.sh
-```
-
-Optional path overrides:
-
-```bash
-GO_BIN=/path/to/go \
-CROSS_PREFIX=/path/to/arm-rockchip830-linux-uclibgnueabihf- \
 ./scripts/build_luckfox_client.sh
 ```
 
@@ -82,42 +45,22 @@ Output:
 reference-code/luckfox-client/build/luckfox-livekit-client
 ```
 
-Expected `file` result:
+The script supports `GO_BIN` and `CROSS_PREFIX` environment overrides when
+the toolchains are installed elsewhere.
 
-```text
-ELF 32-bit LSB executable, ARM, EABI5, interpreter /lib/ld-uClibc.so.0
-```
+## Deploy to Luckfox
 
-## 5. Deploy to a new board
-
-Open Windows PowerShell:
+From Windows PowerShell at the repository root:
 
 ```powershell
-cd "C:\Users\sneha\OneDrive\Documents\PROJECTS\AI VOICE AGENT\Livekit-Deepseek-Deepgram\Luckfox-LiveKit-AI-Voice-Agent-With-PC\scripts"
-powershell -ExecutionPolicy Bypass -File .\deploy_luckfox_with_pc.ps1 -BoardIP 192.168.0.106
+.\DEPLOY-FRESH-LUCKFOX.ps1 -BoardIP <board-ip>
 ```
 
-The script copies:
+This installs the voice client, startup service, environment template, and
+experimental Bluetooth provisioning files. Existing board credentials are
+not overwritten.
 
-```text
-luckfox-livekit-client  -> /root/luckfox-livekit-client
-run-luckfox-livekit.sh  -> /root/run-luckfox-livekit.sh
-use-pc-agent.sh         -> /root/use-pc-agent.sh
-S99zz-livekit-voice     -> /etc/init.d/S99zz-livekit-voice
-environment template    -> /root/luckfox-livekit.env.example
-```
-
-The script does not overwrite an existing `/root/luckfox-livekit.env` because it may contain private credentials.
-
-## 6. Configure a new board once
-
-If the deployment says the board environment is missing:
-
-```powershell
-ssh root@192.168.0.106
-```
-
-On Luckfox:
+## Configure the board once
 
 ```sh
 cp /root/luckfox-livekit.env.example /root/luckfox-livekit.env
@@ -130,56 +73,54 @@ Use:
 LIVEKIT_URL=wss://your-project.livekit.cloud
 LIVEKIT_API_KEY=your_livekit_api_key
 LIVEKIT_API_SECRET=your_livekit_api_secret
-LIVEKIT_AGENT_NAME=my-agent-local
+LIVEKIT_AGENT_NAME=my-agent
 CAPTURE_DEVICE=hw:0,0
 PLAYBACK_DEVICE=hw:0,0
 ```
 
-Then:
+Then protect and restart it:
 
 ```sh
 chmod 600 /root/luckfox-livekit.env
 /etc/init.d/S99zz-livekit-voice restart
-```
-
-Do not put DeepSeek or Deepgram keys on the board.
-
-## 7. Verify deployment
-
-On the board:
-
-```sh
-cat /var/run/luckfox-livekit.pid
-ps -ef | grep -E 'run-luckfox-livekit|luckfox-livekit-client|arecord' | grep -v grep
-grep '^LIVEKIT_AGENT_NAME=' /root/luckfox-livekit.env
 tail -n 60 /root/luckfox-livekit.log
 ```
 
-Expected lines:
+Expected output includes:
 
 ```text
 Connected to LiveKit room luckfox-voice-...
-Dispatched agent my-agent-local
+Dispatched agent my-agent
 Microphone is live. Speak near the Luckfox board.
 Receiving voice from agent-...
 ```
 
-## 8. Reboot test
+## Configure and test the Python agent
+
+```powershell
+cd reference-code\agent-server
+Copy-Item .env.example .env.local
+uv sync --locked
+uv run pytest
+uv run src/agent.py dev
+```
+
+For production, configure the same secrets in LiveKit Cloud and deploy the
+agent from this directory using the LiveKit CLI. Do not put Sarvam or
+DeepSeek credentials on the board.
+
+## Reboot test
 
 ```sh
 reboot
 ```
 
-Reconnect after the board starts:
-
-```powershell
-ssh root@192.168.0.106
-```
-
-Then check:
+After the board returns:
 
 ```sh
-ps -ef | grep -E 'luckfox-livekit-client|arecord' | grep -v grep
+pidof luckfox-livekit-client
 tail -n 40 /root/luckfox-livekit.log
 ```
 
+The PC and ADB may then be disconnected. Keep board power, Wi-Fi, and internet
+available.

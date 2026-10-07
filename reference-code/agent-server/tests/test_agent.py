@@ -17,7 +17,7 @@ def _tool(assistant: Assistant, name: str) -> llm.FunctionTool:
 def test_all_function_tools_are_registered() -> None:
     tool_names = {
         tool.info.name
-        for tool in Assistant().tools
+        for tool in Assistant(None).tools
         if isinstance(tool, llm.FunctionTool)
     }
 
@@ -30,7 +30,7 @@ def test_all_function_tools_are_registered() -> None:
 
 
 async def test_calculator_adds_numbers() -> None:
-    tool = _tool(Assistant(), "calculator")
+    tool = _tool(Assistant(None), "calculator")
 
     result = await tool(
         operation="add",
@@ -42,7 +42,7 @@ async def test_calculator_adds_numbers() -> None:
 
 
 async def test_calculator_handles_division_by_zero() -> None:
-    tool = _tool(Assistant(), "calculator")
+    tool = _tool(Assistant(None), "calculator")
 
     result = await tool(
         operation="divide",
@@ -72,7 +72,7 @@ async def test_get_current_time_returns_requested_location_time(monkeypatch) -> 
         }
 
     monkeypatch.setattr(agent_module, "_fetch_json", fake_fetch_json)
-    tool = _tool(Assistant(), "get_current_time")
+    tool = _tool(Assistant(None), "get_current_time")
 
     result = await tool(location="Tokyo, Japan")
 
@@ -104,7 +104,7 @@ async def test_get_weather_returns_live_conditions(monkeypatch) -> None:
         }
 
     monkeypatch.setattr(agent_module, "_fetch_json", fake_fetch_json)
-    tool = _tool(Assistant(), "get_weather")
+    tool = _tool(Assistant(None), "get_weather")
 
     result = await tool(city="Pune")
 
@@ -115,12 +115,12 @@ async def test_get_weather_returns_live_conditions(monkeypatch) -> None:
     )
 
 
-async def test_search_database_finds_deepgram() -> None:
-    tool = _tool(Assistant(), "search_database")
+async def test_search_database_finds_sarvam() -> None:
+    tool = _tool(Assistant(None), "search_database")
 
-    result = await tool(query="Deepgram")
+    result = await tool(query="Sarvam")
 
-    assert "Deepgram Nova-3 performs speech-to-text" in result
+    assert "Sarvam Saaras v4 performs English and Kannada speech-to-text" in result
 
 
 # Agent behavior is covered by the simulations in scenarios.yaml, which run full

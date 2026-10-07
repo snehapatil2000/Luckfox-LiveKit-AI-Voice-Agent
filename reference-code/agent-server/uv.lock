@@ -13,37 +13,6 @@ resolution-markers = [
 constraints = [{ name = "yarl", specifier = "<1.24" }]
 
 [[package]]
-name = "agent-starter-python"
-version = "1.0.0"
-source = { editable = "." }
-dependencies = [
-    { name = "livekit-agents", extra = ["deepgram", "openai", "sarvam"] },
-    { name = "livekit-plugins-ai-coustics" },
-    { name = "python-dotenv" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "livekit-agents", extras = ["deepgram", "openai", "sarvam"], specifier = ">=1.8.0" },
-    { name = "livekit-plugins-ai-coustics", specifier = "~=0.2" },
-    { name = "python-dotenv" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "ruff" },
-]
-
-[[package]]
 name = "aiofiles"
 version = "25.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1223,6 +1192,37 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/e8/49/733f3655717bd1bdccfbb4ab958ac7f51d7e17d37e61b98de2f6b2e0c107/livekit_protocol-1.1.26.tar.gz", hash = "sha256:de8d291abb2efd026fbe23394ee4c05358195f09102d3c13335978ba04d7bdb8", size = 123833, upload-time = "2026-08-28T17:15:50.225Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/37/a9/b9a9a04b921b1aaef9312c3a16523cd4ddb508dcc4be18ca0e300b750b7e/livekit_protocol-1.1.26-py3-none-any.whl", hash = "sha256:37db1272487518df2ce3e13624a5217d1e158c6832fe01166bb3fb1875a8ddd9", size = 150535, upload-time = "2026-08-28T17:15:48.535Z" },
+]
+
+[[package]]
+name = "luckfox-livekit-voice-agent"
+version = "1.0.0"
+source = { editable = "." }
+dependencies = [
+    { name = "livekit-agents", extra = ["deepgram", "openai", "sarvam"] },
+    { name = "livekit-plugins-ai-coustics" },
+    { name = "python-dotenv" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "livekit-agents", extras = ["deepgram", "openai", "sarvam"], specifier = ">=1.8.0" },
+    { name = "livekit-plugins-ai-coustics", specifier = "~=0.2" },
+    { name = "python-dotenv" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "ruff" },
 ]
 
 [[package]]

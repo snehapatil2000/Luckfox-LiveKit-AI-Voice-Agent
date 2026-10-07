@@ -1,75 +1,142 @@
 # Luckfox LiveKit AI Voice Agent
 
-This repository contains the complete Luckfox Pico Pi AI voice-agent project.
-The verified voice path runs without a PC after the board has been configured:
+A bilingual English/Kannada voice assistant for the Luckfox Pico Pi A W.
+The board captures and plays audio while the Python agent runs in LiveKit
+Cloud, so normal operation needs only board power, audio hardware, Wi-Fi, and
+internet access. A PC is needed for development, deployment, and logs—not for
+the live voice conversation.
+
+Repository: <https://github.com/snehapatil2000/Luckfox-LiveKit-AI-Voice-Agent>
+
+## Architecture
 
 ```text
-Luckfox microphone
-    -> LiveKit Cloud
-    -> Python agent
-    -> Sarvam Saaras STT
-    -> DeepSeek LLM
-    -> Sarvam Bulbul TTS
-    -> LiveKit Cloud
-    -> Luckfox speaker or headphones
+User -> Luckfox microphone -> LiveKit Cloud -> Python agent
+                                             |
+                                             +-> Sarvam Saaras v4 STT
+                                             +-> DeepSeek V4 Flash LLM
+                                             +-> Sarvam Bulbul v3 TTS
+                                             |
+Luckfox headphones/speaker <- LiveKit Cloud <-+
 ```
 
-The agent supports English and Kannada, uses **Hey Siri** as the wake phrase,
-and keeps the board voice client running automatically at boot. The PC is used
-for development, deployment, and viewing logs; it is not required during the
-normal board-only demonstration. Wi-Fi internet and board power are required.
+- English: Sarvam Saaras STT -> DeepSeek -> Sarvam Bulbul `en-IN` TTS
+- Kannada: Sarvam Saaras STT -> DeepSeek -> Sarvam Bulbul `kn-IN` TTS
+- Wake phrase: **Hey Siri** at the start of every question
+- Barge-in: say **Hey Siri** plus a new question while an answer is playing
+- Tools: calculator, current time/date, live weather, and project information
+- Startup: `/etc/init.d/S99zz-livekit-voice` starts the board client at boot
 
-## Main project folders
+## Repository layout
 
 ```text
-reference-code/agent-server/       Python LiveKit Cloud agent
-reference-code/luckfox-client/     ARM client source and deployable binary
-luckfox-wifi-provision/            Bluetooth Wi-Fi provisioning service
-luckfox-wifi-provision-app/        Android provisioning app source
-docs/                              Build, deployment, demo, and security notes
-DEPLOY-FRESH-LUCKFOX.ps1           Fresh-board deployment script
+reference-code/agent-server/       Python LiveKit agent and tests
+reference-code/luckfox-client/     Go audio client, ARM binary, board service
+luckfox-wifi-provision/            Experimental Bluetooth provisioning service
+luckfox-wifi-provision-app/        Experimental Android provisioning app
+docs/                              Setup, logs, troubleshooting, and demo notes
+DEPLOY-FRESH-LUCKFOX.ps1           Complete fresh-board deployment
 ```
 
-## Cloud agent
+Bluetooth Wi-Fi provisioning is included but is not part of the confirmed
+voice demo. Configure Wi-Fi on the board directly until that work is resumed.
 
-Copy `reference-code/agent-server/.env.example` to a local `.env.local` and
-fill in the LiveKit, DeepSeek, and Sarvam credentials. Never commit `.env.local`
-or API keys.
+## Requirements
+
+- Luckfox Pico Pi A W with microphone and speaker/headphones
+- 2.4 GHz Wi-Fi with internet access
+- LiveKit Cloud project and deployed agent named `my-agent`
+- LiveKit, DeepSeek, and Sarvam API credentials
+- Windows/WSL only for building, deploying, and monitoring
+
+## Configure the cloud agent
 
 ```powershell
 cd reference-code\agent-server
+Copy-Item .env.example .env.local
+notepad .env.local
 uv sync --locked
-uv run python src\agent.py dev
+uv run pytest
 ```
 
-The production agent can also be deployed with the LiveKit CLI. The tracked
-`uv.lock` file keeps the dependency versions reproducible.
+Required values in `.env.local`:
 
-## Fresh Luckfox deployment
+```dotenv
+LIVEKIT_URL=wss://your-project.livekit.cloud
+LIVEKIT_API_KEY=your_livekit_api_key
+LIVEKIT_API_SECRET=your_livekit_api_secret
+DEEPSEEK_API_KEY=your_deepseek_api_key
+SARVAM_API_KEY=your_sarvam_api_key
+```
 
-The deployable ARM client is kept at:
+Run locally with `uv run src/agent.py dev`, or deploy from this directory with
+the LiveKit CLI. Cloud credentials must be configured as deployment secrets.
+
+## Deploy the Luckfox client
+
+The tracked ARM client is:
 
 ```text
 reference-code/luckfox-client/build/luckfox-livekit-client
 ```
 
-From PowerShell:
+From the repository root in PowerShell:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\DEPLOY-FRESH-LUCKFOX.ps1 -BoardIP <board-ip>
+.\DEPLOY-FRESH-LUCKFOX.ps1 -BoardIP <board-ip>
 ```
 
-The board services are:
+Configure `/root/luckfox-livekit.env` on the board, set
+`LIVEKIT_AGENT_NAME=my-agent`, protect it with `chmod 600`, and restart:
+
+```sh
+/etc/init.d/S99zz-livekit-voice restart
+tail -f /root/luckfox-livekit.log
+```
+
+Expected lines include `Connected to LiveKit room`, `Dispatched agent
+my-agent`, `Microphone is live`, and `Receiving voice from agent`.
+
+## Test
+
+Ask near the board:
 
 ```text
-/etc/init.d/S99zz-livekit-voice
-/etc/init.d/S98wifi-provision
+Hey Siri, what time is it?
+Hey Siri, tell me the districts of Karnataka.
+Hey Siri, ಕರ್ನಾಟಕದ ಜಿಲ್ಲೆಗಳನ್ನು ಹೇಳು.
 ```
 
-Bluetooth Wi-Fi provisioning files are included for the later provisioning
-step. The confirmed voice-agent path uses the board's configured Wi-Fi.
+Every independent question must include **Hey Siri**. During a long answer,
+say **Hey Siri** followed by the next question to stop the old reply and start
+the new one.
+
+## Logs
+
+Board transport/audio logs:
+
+```powershell
+adb -s <board-serial> shell "tail -f /root/luckfox-livekit.log"
+```
+
+Cloud transcript and state logs:
+
+```powershell
+lk agent logs --id <cloud-agent-id> --project <project-name> --log-type deploy
+```
+
+Cloud logs show `VOICE USER`, `VOICE ASSISTANT`, `VOICE STATE`, tool calls,
+wake-word decisions, and Sarvam WebSocket status. Board logs do not contain
+the complete speech transcript.
 
 ## Security
 
-No real API keys are included in this repository. Keep all runtime credentials
-in local environment files or the board's protected runtime configuration.
+Real API keys and `.env.local` are intentionally excluded. Never commit
+LiveKit secrets, DeepSeek keys, Sarvam keys, private keys, or board runtime
+environment files. The board currently stores LiveKit credentials for this
+prototype; production hardware should obtain short-lived tokens from a
+trusted token service.
+
+See [docs/01-FULL-PROJECT-WORKFLOW.md](docs/01-FULL-PROJECT-WORKFLOW.md) for
+the complete flow and [docs/05-INSTRUCTOR-DEMO.md](docs/05-INSTRUCTOR-DEMO.md)
+for a short demonstration script.

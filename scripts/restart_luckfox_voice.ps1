@@ -1,5 +1,6 @@
 param(
-    [string]$BoardIP = "192.168.0.106"
+    [Parameter(Mandatory = $true)]
+    [string]$BoardIP
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,4 +13,3 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "Restart complete. Watch the PC agent for a new job request." -ForegroundColor Green
-

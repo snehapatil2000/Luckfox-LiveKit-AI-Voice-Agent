@@ -1,5 +1,4 @@
 import asyncio
-from difflib import SequenceMatcher
 import json
 import logging
 import os
@@ -7,6 +6,7 @@ import re
 import textwrap
 import time
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from typing import Any, Literal
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -128,10 +128,10 @@ PROJECT_DATABASE = (
         ),
     },
     {
-        "name": "Deepgram",
+        "name": "Sarvam",
         "details": (
-            "Deepgram Nova-3 performs speech-to-text, and Deepgram Aura-2 Andromeda "
-            "performs text-to-speech."
+            "Sarvam Saaras v4 performs English and Kannada speech-to-text. "
+            "Sarvam Bulbul v3 performs English and Kannada text-to-speech."
         ),
     },
     {
@@ -142,10 +142,11 @@ PROJECT_DATABASE = (
         ),
     },
     {
-        "name": "Windows PC mode",
+        "name": "Cloud deployment",
         "details": (
-            "In with-PC mode, the Python LiveKit agent runs on the Windows PC, so the PC "
-            "must remain powered on and connected to the internet."
+            "The production Python agent runs in LiveKit Cloud. The Luckfox needs "
+            "power, audio hardware, Wi-Fi, and internet, but normal use does not "
+            "require the development PC or ADB."
         ),
     },
     {
@@ -397,8 +398,8 @@ class Assistant(Agent):
     async def search_database(self, query: str) -> str:
         """Search the local demonstration database for voice-agent project facts.
 
-        Use this tool for stored information about Luckfox, LiveKit, Deepgram,
-        DeepSeek, Windows PC mode, or the wake word.
+        Use this tool for stored information about Luckfox, LiveKit, Sarvam,
+        DeepSeek, cloud deployment, or the wake word.
 
         Args:
             query: The project information to search for.
@@ -557,6 +558,7 @@ async def my_agent(ctx: agents.JobContext):
             preemptive_generation={"enabled": True},
         ),
     )
+    background_tasks = set()
 
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(event):
@@ -608,7 +610,9 @@ async def my_agent(ctx: agents.JobContext):
                     allow_interruptions=False,
                 )
 
-            asyncio.create_task(handle_wake_barge_in())
+            task = asyncio.create_task(handle_wake_barge_in())
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
 
     @session.on("conversation_item_added")
     def on_conversation_item_added(event):

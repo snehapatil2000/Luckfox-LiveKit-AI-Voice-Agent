@@ -1,5 +1,6 @@
 param(
-    [string]$BoardIP = "192.168.0.106",
+    [Parameter(Mandatory = $true)]
+    [string]$BoardIP,
     [string]$AgentDirectory = "$env:USERPROFILE\Downloads\agent-server"
 )
 
@@ -31,8 +32,7 @@ $env:LIVEKIT_AGENT_NAME = "my-agent-local"
 Write-Host ""
 Write-Host "Starting the local Python agent. Keep this window open." -ForegroundColor Green
 Write-Host "Wait for VOICE STATE: listening. Then speak near Luckfox."
-Write-Host "Example: Agent, what is the capital of India?"
+Write-Host "Example: Hey Siri, what is the capital of India?"
 Write-Host "Press Ctrl+C to stop."
 
 uv run src/agent.py dev
-
