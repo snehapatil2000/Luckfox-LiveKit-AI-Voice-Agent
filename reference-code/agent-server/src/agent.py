@@ -40,6 +40,14 @@ BUTTON_SPEECH_TIMEOUT = 3.0
 
 
 KANNADA_SCRIPT = re.compile(r"[\u0C80-\u0CFF]")
+LATIN_SCRIPT = re.compile(r"[A-Za-z]")
+ENGLISH_REQUEST = re.compile(
+    r"\bin\s+english\b|\b(?:english|inglish)(?:nalli|alli)\b|"
+    r"(?:ಇಂಗ್ಲಿಷ್|ಆಂಗ್ಲ)[\u200c\u200d]*(?:ನಲ್ಲಿ|ದಲ್ಲಿ)"
+)
+KANNADA_REQUEST = re.compile(
+    r"\bin\s+kannada\b|\bkannada(?:dalli|nalli|alli)\b|ಕನ್ನಡ(?:ದಲ್ಲಿ|ದಲ್ಲೇ|ದಲ್ಲಿ ಮಾತ್ರ)"
+)
 SARVAM_ENABLED = bool(os.getenv("SARVAM_API_KEY"))
 OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
@@ -141,6 +149,18 @@ async def _fetch_json(url: str, parameters: dict[str, Any]) -> dict[str, Any]:
     return await asyncio.to_thread(request)
 
 
+def select_response_language(user_text: str) -> Literal["en", "kn"]:
+    """Use an explicit request, otherwise answer in the dominant input script."""
+    normalized = user_text.casefold()
+    if ENGLISH_REQUEST.search(normalized):
+        return "en"
+    if KANNADA_REQUEST.search(normalized):
+        return "kn"
+    kannada_characters = len(KANNADA_SCRIPT.findall(user_text))
+    latin_characters = len(LATIN_SCRIPT.findall(user_text))
+    return "kn" if kannada_characters > latin_characters else "en"
+
+
 class Assistant(Agent):
     def __init__(
         self,
@@ -169,8 +189,9 @@ class Assistant(Agent):
                 For current weather requests, always call the get_weather tool.
                 To find stored information about this voice-agent project, always
                 call the search_database tool.
-                Reply in the same language as the user. If the user speaks Kannada,
-                answer in Kannada script. If the user speaks English, answer in English.
+                Reply in the same language as the user's current question, independent
+                of earlier turns. If the user explicitly requests English or Kannada,
+                use the requested language instead.
                 Never invent tool results. Use the selected tool result in a short
                 spoken answer. Call only the tool or tools needed for the request.
                 """
@@ -422,16 +443,25 @@ class Assistant(Agent):
         if not user_text:
             raise StopResponse()
 
-        new_message.content = [user_text]
+        response_language = select_response_language(user_text)
+        language_name = "Kannada" if response_language == "kn" else "English"
+        new_message.content = [
+            f"{user_text}\n\nAnswer this turn only in {language_name}. "
+            "Do not copy the language used in earlier answers."
+        ]
         if self._kannada_tts is not None:
             self.update_options(
                 tts=(
                     self._kannada_tts
-                    if KANNADA_SCRIPT.search(user_text)
+                    if response_language == "kn"
                     else self._english_tts
                 )
             )
-        logger.info("PUSH BUTTON: accepted one question: %s", user_text)
+        logger.info(
+            "PUSH BUTTON: accepted one question language=%s: %s",
+            language_name,
+            user_text,
+        )
 
 
 server = AgentServer()
