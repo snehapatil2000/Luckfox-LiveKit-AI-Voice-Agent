@@ -6,8 +6,7 @@ import re
 import textwrap
 import time
 from datetime import datetime, timedelta, timezone
-from difflib import SequenceMatcher
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -36,6 +35,8 @@ logger = logging.getLogger("voice-transcript")
 
 BUTTON_TOPIC = "luckfox-control"
 BUTTON_EVENT_TYPE = "arm_question"
+MIC_SLEEP_EVENT_TYPE = "mic_sleep"
+BUTTON_SPEECH_TIMEOUT = 3.0
 
 
 KANNADA_SCRIPT = re.compile(r"[\u0C80-\u0CFF]")
@@ -141,12 +142,17 @@ async def _fetch_json(url: str, parameters: dict[str, Any]) -> dict[str, Any]:
 
 
 class Assistant(Agent):
-    def __init__(self, english_tts, kannada_tts=None):
-        self._last_assistant_text = ""
-        self._last_assistant_time = 0.0
+    def __init__(
+        self,
+        english_tts,
+        kannada_tts=None,
+        on_sleep: Callable[[], None] | None = None,
+    ):
         self._english_tts = english_tts
         self._kannada_tts = kannada_tts
+        self._on_sleep = on_sleep
         self._button_armed = False
+        self._button_speech_started = False
         super().__init__(
             instructions=textwrap.dedent(
                 """
@@ -174,35 +180,34 @@ class Assistant(Agent):
     def arm_from_button(self) -> None:
         """Allow exactly one question after a hardware-button press."""
         self._button_armed = True
-        logger.info("PUSH BUTTON: armed one question; waiting for speech")
+        self._button_speech_started = False
+        logger.info("PUSH BUTTON: armed; speak within 3000 ms")
+
+    def mark_button_speech_started(self) -> bool:
+        """Record speech start for the currently armed question."""
+        if not self._button_armed or self._button_speech_started:
+            return False
+        self._button_speech_started = True
+        return True
+
+    def expire_button_arm(self) -> bool:
+        """Return to standby if no speech started after the button press."""
+        if not self._button_armed or self._button_speech_started:
+            return False
+        self._button_armed = False
+        if self._on_sleep is not None:
+            self._on_sleep()
+        return True
 
     def consume_button_arm(self) -> bool:
         """Consume and return the current one-question hardware arm."""
-        if not self._button_armed:
+        if not self._button_armed or not self._button_speech_started:
             return False
         self._button_armed = False
+        self._button_speech_started = False
+        if self._on_sleep is not None:
+            self._on_sleep()
         return True
-
-    def _looks_like_tts_echo(self, user_text: str) -> bool:
-        """Reject the board speaker being re-captured by its microphone."""
-        if (
-            not self._last_assistant_text
-            or time.monotonic() - self._last_assistant_time > 8.0
-        ):
-            return False
-
-        user_words = set(re.findall(r"\w+", user_text.lower(), flags=re.UNICODE))
-        answer_words = set(
-            re.findall(r"\w+", self._last_assistant_text.lower(), flags=re.UNICODE)
-        )
-        if not user_words or len(user_words) > 14 or not answer_words:
-            return False
-
-        overlap = len(user_words & answer_words) / len(user_words)
-        similarity = SequenceMatcher(
-            None, user_text.lower(), self._last_assistant_text.lower()
-        ).ratio()
-        return (len(user_words) == 1 and overlap == 1.0) or overlap >= 0.5 or similarity >= 0.65
 
     @function_tool
     async def calculator(
@@ -410,9 +415,6 @@ class Assistant(Agent):
 
     async def on_user_turn_completed(self, turn_ctx, new_message):
         user_text = (new_message.raw_text_content or "").strip()
-        if self._looks_like_tts_echo(user_text):
-            logger.info("TTS ECHO: ignored assistant audio as user speech: %s", user_text)
-            raise StopResponse()
         if not self.consume_button_arm():
             logger.info("STANDBY: ignored speech; press the button for one question")
             raise StopResponse()
@@ -465,7 +467,6 @@ async def my_agent(ctx: agents.JobContext):
         if SARVAM_ENABLED
         else None
     )
-    assistant = Assistant(english_tts, kannada_tts)
     session = AgentSession(
         stt=(
             sarvam.STT(
@@ -484,11 +485,13 @@ async def my_agent(ctx: agents.JobContext):
         tts=english_tts,
         turn_handling=TurnHandlingOptions(
             turn_detection=inference.TurnDetector(unlikely_threshold=0.4),
-            # Shorter endpointing makes the response start sooner after the
-            # user stops speaking while keeping a small pause for natural
-            # speech. The hardware button is the only activation control.
-            # Commit completed turns quickly for a more immediate response.
-            endpointing={"min_delay": 0.18, "max_delay": 0.55},
+            # After speech starts, wait for three seconds of silence before
+            # committing the question. This lets users pause naturally.
+            endpointing={
+                "mode": "fixed",
+                "min_delay": BUTTON_SPEECH_TIMEOUT,
+                "max_delay": BUTTON_SPEECH_TIMEOUT,
+            },
             # Luckfox speaker audio is captured by its nearby microphone.
             # Do not use acoustic interruption: the button is the only
             # activation control, which prevents speaker echo/noise from
@@ -506,8 +509,52 @@ async def my_agent(ctx: agents.JobContext):
             preemptive_generation={"enabled": True},
         ),
     )
+    loop = asyncio.get_running_loop()
+
+    async def notify_mic_sleep() -> None:
+        try:
+            await ctx.room.local_participant.publish_data(
+                json.dumps({"type": MIC_SLEEP_EVENT_TYPE}),
+                reliable=True,
+                topic=BUTTON_TOPIC,
+            )
+        except Exception:
+            logger.exception("STANDBY: failed to send MIC1 sleep event")
+
+    def enter_sleep() -> None:
+        session.input.set_audio_enabled(False)
+        loop.create_task(notify_mic_sleep())
+        logger.info("STANDBY: audio input disabled; MIC1 sleep requested")
+
+    session.input.set_audio_enabled(False)
+    logger.info("STANDBY: audio input disabled until the push button is pressed")
+    assistant = Assistant(
+        english_tts,
+        kannada_tts,
+        on_sleep=enter_sleep,
+    )
+    arm_timeout: asyncio.TimerHandle | None = None
+
+    def cancel_arm_timeout() -> None:
+        nonlocal arm_timeout
+        if arm_timeout is not None:
+            arm_timeout.cancel()
+            arm_timeout = None
+
+    def expire_silent_arm() -> None:
+        nonlocal arm_timeout
+        arm_timeout = None
+        if assistant.expire_button_arm():
+            logger.info("PUSH BUTTON: no speech within 3000 ms; standby")
+
+    def record_speech_start() -> None:
+        if assistant.mark_button_speech_started():
+            cancel_arm_timeout()
+            logger.info("PUSH BUTTON: speech started; capturing until 3000 ms silence")
+
     @ctx.room.on("data_received")
     def on_data_received(packet):
+        nonlocal arm_timeout
         if packet.topic != BUTTON_TOPIC:
             return
         try:
@@ -516,11 +563,26 @@ async def my_agent(ctx: agents.JobContext):
             logger.warning("PUSH BUTTON: ignored invalid control packet")
             return
         if payload.get("type") == BUTTON_EVENT_TYPE:
-            assistant.arm_from_button()
             speech = session.current_speech
             if speech is not None and not speech.interrupted:
                 logger.info("PUSH BUTTON: interrupting current answer")
-                asyncio.create_task(session.interrupt(force=True))
+                session.interrupt(force=True)
+            assistant.arm_from_button()
+            session.input.set_audio_enabled(True)
+            cancel_arm_timeout()
+            arm_timeout = loop.call_later(
+                BUTTON_SPEECH_TIMEOUT, expire_silent_arm
+            )
+
+    @session.on("user_state_changed")
+    def on_user_state_changed(event):
+        if event.new_state == "speaking":
+            record_speech_start()
+
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed(event):
+        if event.transcript.strip():
+            record_speech_start()
 
     @session.on("conversation_item_added")
     def on_conversation_item_added(event):
@@ -530,8 +592,6 @@ async def my_agent(ctx: agents.JobContext):
 
         response = getattr(item, "text_content", None)
         if response:
-            assistant._last_assistant_text = response.strip()
-            assistant._last_assistant_time = time.monotonic()
             logger.info("VOICE ASSISTANT: %s", response.strip())
 
     @session.on("agent_state_changed")
@@ -545,6 +605,7 @@ async def my_agent(ctx: agents.JobContext):
     )
 
     await ctx.connect()
+    await notify_mic_sleep()
 
 
 if __name__ == "__main__":
