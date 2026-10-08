@@ -34,40 +34,8 @@ load_dotenv(".env.local")
 
 logger = logging.getLogger("voice-transcript")
 
-WAKE_WORD = re.compile(
-    r"^\s*hey[\s,;:!-]+siri\b[\s,!.?:;-]*",
-    flags=re.IGNORECASE,
-)
-WAKE_WORD_ANYWHERE = re.compile(
-    r"\bhey[\s,;:!-]+siri\b[\s,!.?:;-]*",
-    flags=re.IGNORECASE,
-)
-WAKE_WINDOW_SECONDS = 10.0
-STOP_PREFIX = re.compile(
-    r"^\s*(?:stop|cancel)\b[\s,;:!.?-]*(?:(?:hey[\s,;:!-]+)?siri\b[\s,!.?:;-]*)?",
-    flags=re.IGNORECASE,
-)
-
-
-def _wake_command(text: str) -> str | None:
-    """Return the command after Hey Siri, or None when no wake word exists."""
-    wake_match = WAKE_WORD.match(text)
-    if wake_match is None:
-        return None
-    return STOP_PREFIX.sub("", text[wake_match.end() :], count=1).strip()
-
-
-def _barge_in_command(text: str) -> str | None:
-    """Extract a wake command even when STT prefixes captured speaker audio."""
-    wake_matches = list(WAKE_WORD_ANYWHERE.finditer(text))
-    if not wake_matches:
-        return None
-    return STOP_PREFIX.sub("", text[wake_matches[-1].end() :], count=1).strip()
-
-
-def _turn_key(text: str) -> str:
-    """Normalize a transcript for duplicate-turn detection."""
-    return " ".join(re.findall(r"\w+", text.casefold(), flags=re.UNICODE))
+BUTTON_TOPIC = "luckfox-control"
+BUTTON_EVENT_TYPE = "arm_question"
 
 
 KANNADA_SCRIPT = re.compile(r"[\u0C80-\u0CFF]")
@@ -150,10 +118,10 @@ PROJECT_DATABASE = (
         ),
     },
     {
-        "name": "Wake word",
+        "name": "Push-button standby",
         "details": (
-            "The configured wake word is Hey Siri. Speech without it is ignored unless "
-            "the assistant is inside its ten-second listening window."
+            "The assistant stays in standby and ignores speech until the physical "
+            "button is pressed. One press arms exactly one question until speech is accepted."
         ),
     },
 )
@@ -174,14 +142,11 @@ async def _fetch_json(url: str, parameters: dict[str, Any]) -> dict[str, Any]:
 
 class Assistant(Agent):
     def __init__(self, english_tts, kannada_tts=None):
-        self._awake_until = 0.0
-        self._conversation_active = False
         self._last_assistant_text = ""
         self._last_assistant_time = 0.0
         self._english_tts = english_tts
         self._kannada_tts = kannada_tts
-        self._manual_barge_in_key = ""
-        self._manual_barge_in_until = 0.0
+        self._button_armed = False
         super().__init__(
             instructions=textwrap.dedent(
                 """
@@ -205,6 +170,18 @@ class Assistant(Agent):
                 """
             )
         )
+
+    def arm_from_button(self) -> None:
+        """Allow exactly one question after a hardware-button press."""
+        self._button_armed = True
+        logger.info("PUSH BUTTON: armed one question; waiting for speech")
+
+    def consume_button_arm(self) -> bool:
+        """Consume and return the current one-question hardware arm."""
+        if not self._button_armed:
+            return False
+        self._button_armed = False
+        return True
 
     def _looks_like_tts_echo(self, user_text: str) -> bool:
         """Reject the board speaker being re-captured by its microphone."""
@@ -399,7 +376,7 @@ class Assistant(Agent):
         """Search the local demonstration database for voice-agent project facts.
 
         Use this tool for stored information about Luckfox, LiveKit, Sarvam,
-        DeepSeek, cloud deployment, or the wake word.
+        DeepSeek, cloud deployment, or push-button standby.
 
         Args:
             query: The project information to search for.
@@ -433,56 +410,26 @@ class Assistant(Agent):
 
     async def on_user_turn_completed(self, turn_ctx, new_message):
         user_text = (new_message.raw_text_content or "").strip()
-        turn_key = _turn_key(user_text)
-        if (
-            time.monotonic() <= self._manual_barge_in_until
-            and self._manual_barge_in_key
-            and (
-                turn_key.startswith(self._manual_barge_in_key)
-                or self._manual_barge_in_key.startswith(turn_key)
-            )
-        ):
-            self._manual_barge_in_key = ""
-            logger.info("WAKE BARGE-IN: suppressed duplicate committed turn")
-            raise StopResponse()
         if self._looks_like_tts_echo(user_text):
             logger.info("TTS ECHO: ignored assistant audio as user speech: %s", user_text)
             raise StopResponse()
-        command = _wake_command(user_text)
-
-        if command is not None:
-            if not command:
-                self._conversation_active = True
-                self._awake_until = time.monotonic() + WAKE_WINDOW_SECONDS
-                logger.info(
-                    "WAKE WORD: activated for %.0f seconds", WAKE_WINDOW_SECONDS
-                )
-                self.session.say(
-                    "Yes, I'm listening.",
-                    allow_interruptions=True,
-                    add_to_chat_ctx=False,
-                )
-                raise StopResponse()
-        else:
-            logger.info("WAKE WORD: ignored speech without Hey Siri")
+        if not self.consume_button_arm():
+            logger.info("STANDBY: ignored speech; press the button for one question")
             raise StopResponse()
 
-        self._conversation_active = True
-        self._awake_until = time.monotonic() + WAKE_WINDOW_SECONDS
-        if not command:
+        if not user_text:
             raise StopResponse()
 
-        # Give only the command to the LLM, without the wake words.
-        new_message.content = [command]
+        new_message.content = [user_text]
         if self._kannada_tts is not None:
             self.update_options(
                 tts=(
                     self._kannada_tts
-                    if KANNADA_SCRIPT.search(command)
+                    if KANNADA_SCRIPT.search(user_text)
                     else self._english_tts
                 )
             )
-        logger.info("VOICE USER: %s", command)
+        logger.info("PUSH BUTTON: accepted one question: %s", user_text)
 
 
 server = AgentServer()
@@ -539,17 +486,18 @@ async def my_agent(ctx: agents.JobContext):
             turn_detection=inference.TurnDetector(unlikely_threshold=0.4),
             # Shorter endpointing makes the response start sooner after the
             # user stops speaking while keeping a small pause for natural
-            # speech. Wake-word filtering remains unchanged.
+            # speech. The hardware button is the only activation control.
             # Commit completed turns quickly for a more immediate response.
             endpointing={"min_delay": 0.18, "max_delay": 0.55},
             # Luckfox speaker audio is captured by its nearby microphone.
-            # Require the current answer to finish; every new command already
-            # requires "Hey Siri", so automatic acoustic barge-in is unsafe.
+            # Do not use acoustic interruption: the button is the only
+            # activation control, which prevents speaker echo/noise from
+            # cutting an answer short.
             interruption={
                 "mode": "adaptive",
                 "enabled": False,
-                # Keep STT active while TTS plays so an explicit "Hey Siri"
-                # can interrupt, while ordinary speech and echo cannot.
+                # Keep the session stable while TTS plays; a later button
+                # press arms the next question.
                 "discard_audio_if_uninterruptible": False,
                 "min_duration": 0.45,
                 "min_words": 4,
@@ -558,61 +506,21 @@ async def my_agent(ctx: agents.JobContext):
             preemptive_generation={"enabled": True},
         ),
     )
-    background_tasks = set()
-
-    @session.on("user_input_transcribed")
-    def on_user_input_transcribed(event):
-        transcript = event.transcript.strip()
-        speech = session.current_speech
-        if (
-            event.is_final
-            and _barge_in_command(transcript) is not None
-            and speech is not None
-            and not speech.interrupted
-        ):
-            # Automatic acoustic interruption is disabled because the nearby
-            # speaker is recaptured by the microphone. An explicit final
-            # "Hey Siri" turn is safe: preserve it, stop the old reply, then
-            # submit the command directly so LiveKit cannot drop it as part of
-            # the interrupted turn.
-            assistant._manual_barge_in_key = _turn_key(transcript)
-            assistant._manual_barge_in_until = time.monotonic() + 5.0
-            logger.info("WAKE BARGE-IN: stopping old reply for: %s", transcript)
-
-            async def handle_wake_barge_in() -> None:
-                command = _barge_in_command(transcript)
-                if command is None:
-                    return
-
-                await session.interrupt(force=True)
-                assistant._conversation_active = True
-                assistant._awake_until = time.monotonic() + WAKE_WINDOW_SECONDS
-
-                if not command:
-                    session.say(
-                        "Yes, I'm listening.",
-                        allow_interruptions=False,
-                        add_to_chat_ctx=False,
-                    )
-                    return
-
-                if assistant._kannada_tts is not None:
-                    assistant.update_options(
-                        tts=(
-                            assistant._kannada_tts
-                            if KANNADA_SCRIPT.search(command)
-                            else assistant._english_tts
-                        )
-                    )
-                logger.info("VOICE USER: %s", command)
-                session.generate_reply(
-                    user_input=command,
-                    allow_interruptions=False,
-                )
-
-            task = asyncio.create_task(handle_wake_barge_in())
-            background_tasks.add(task)
-            task.add_done_callback(background_tasks.discard)
+    @ctx.room.on("data_received")
+    def on_data_received(packet):
+        if packet.topic != BUTTON_TOPIC:
+            return
+        try:
+            payload = json.loads(packet.data.decode("utf-8"))
+        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+            logger.warning("PUSH BUTTON: ignored invalid control packet")
+            return
+        if payload.get("type") == BUTTON_EVENT_TYPE:
+            assistant.arm_from_button()
+            speech = session.current_speech
+            if speech is not None and not speech.interrupted:
+                logger.info("PUSH BUTTON: interrupting current answer")
+                asyncio.create_task(session.interrupt(force=True))
 
     @session.on("conversation_item_added")
     def on_conversation_item_added(event):
