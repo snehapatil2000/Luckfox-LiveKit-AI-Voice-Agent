@@ -8,11 +8,18 @@ Luckfox voice assistant.
 ```text
 Luckfox audio -> LiveKit -> Sarvam Saaras v4 -> DeepSeek V4 Flash
               <- LiveKit <- Sarvam Bulbul v3 <- generated answer
+
+Smart-home request -> DeepSeek tool call -> LiveKit data packet -> Luckfox
+                   -> authenticated LAN request -> A20 GeckoLink -> Zigbee
 ```
 
-The agent supports English and Kannada. Each question must start with **Hey
-Siri**. An explicit Hey Siri command can interrupt a reply; ordinary speech
-and speaker echo cannot.
+The agent supports English and Kannada. The physical Luckfox button arms one
+question and can interrupt a reply. Ordinary speech and speaker echo are
+ignored while the assistant is in standby.
+
+GeckoLink tools list and control existing points, read live point status, and
+activate existing scenes or moods. Device discovery, pairing, naming, and user
+administration stay in the GeckoLink mobile app.
 
 ## Setup
 
@@ -49,6 +56,6 @@ lk agent logs --id <cloud-agent-id> --project <project-name> --log-type deploy
 ```
 
 Useful log messages are `VOICE USER`, `VOICE ASSISTANT`, `VOICE STATE`,
-`WAKE WORD`, `WAKE BARGE-IN`, `TOOL CALL`, and `TOOL RESULT`.
+`PUSH BUTTON`, `TOOL CALL`, and `TOOL RESULT`.
 
 Never commit `.env.local` or copy cloud-provider secrets into source files.

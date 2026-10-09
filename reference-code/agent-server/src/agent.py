@@ -4,7 +4,8 @@ import logging
 import os
 import re
 import textwrap
-import time
+import uuid
+from collections.abc import Awaitable
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Literal
 from urllib.parse import urlencode
@@ -24,6 +25,8 @@ from livekit.agents import (
 )
 from livekit.plugins import deepgram, openai
 
+from geckolink import GeckoLinkClient, GeckoLinkError
+
 try:
     from livekit.plugins import sarvam
 except ImportError:  # Keep English usable before the optional dependency is synced.
@@ -36,6 +39,9 @@ logger = logging.getLogger("voice-transcript")
 BUTTON_TOPIC = "luckfox-control"
 BUTTON_EVENT_TYPE = "arm_question"
 MIC_SLEEP_EVENT_TYPE = "mic_sleep"
+GECKOLINK_REQUEST_EVENT_TYPE = "geckolink_request"
+GECKOLINK_RESPONSE_EVENT_TYPE = "geckolink_response"
+GECKOLINK_REQUEST_TIMEOUT = 12.0
 BUTTON_SPEECH_TIMEOUT = 3.0
 
 
@@ -161,16 +167,73 @@ def select_response_language(user_text: str) -> Literal["en", "kn"]:
     return "kn" if kannada_characters > latin_characters else "en"
 
 
+class RoomGeckoLinkTransport:
+    """Send restricted GeckoLink requests through the connected Luckfox board."""
+
+    def __init__(self, room):
+        self._room = room
+        self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+
+    async def request(
+        self, method: str, path: str, body: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        request_id = uuid.uuid4().hex
+        future = asyncio.get_running_loop().create_future()
+        self._pending[request_id] = future
+        packet = {
+            "type": GECKOLINK_REQUEST_EVENT_TYPE,
+            "request_id": request_id,
+            "method": method,
+            "path": path,
+            "body": body,
+        }
+        try:
+            await self._room.local_participant.publish_data(
+                json.dumps(packet), reliable=True, topic=BUTTON_TOPIC
+            )
+            response = await asyncio.wait_for(future, timeout=GECKOLINK_REQUEST_TIMEOUT)
+        except TimeoutError as error:
+            raise GeckoLinkError(
+                "The GeckoLink gateway did not respond. Check the Luckfox and A20 connection."
+            ) from error
+        finally:
+            self._pending.pop(request_id, None)
+
+        status = int(response.get("status") or 0)
+        response_body = response.get("body")
+        if status < 200 or status >= 300:
+            detail = response.get("error") or ""
+            if isinstance(response_body, dict):
+                detail = (
+                    response_body.get("message") or response_body.get("error") or detail
+                )
+            raise GeckoLinkError(
+                f"GeckoLink rejected the request{': ' + str(detail) if detail else '.'}"
+            )
+        if not isinstance(response_body, dict):
+            raise GeckoLinkError("The GeckoLink gateway returned an invalid response.")
+        return response_body
+
+    def handle_response(self, payload: dict[str, Any]) -> bool:
+        if payload.get("type") != GECKOLINK_RESPONSE_EVENT_TYPE:
+            return False
+        future = self._pending.get(str(payload.get("request_id") or ""))
+        if future is not None and not future.done():
+            future.set_result(payload)
+        return True
+
 class Assistant(Agent):
     def __init__(
         self,
         english_tts,
         kannada_tts=None,
         on_sleep: Callable[[], None] | None = None,
+        geckolink: GeckoLinkClient | None = None,
     ):
         self._english_tts = english_tts
         self._kannada_tts = kannada_tts
         self._on_sleep = on_sleep
+        self._geckolink = geckolink
         self._button_armed = False
         self._button_speech_started = False
         super().__init__(
@@ -189,6 +252,20 @@ class Assistant(Agent):
                 For current weather requests, always call the get_weather tool.
                 To find stored information about this voice-agent project, always
                 call the search_database tool.
+                For every smart-home point, switch, light, scene, mood, or status
+                request, always call the matching GeckoLink automation tool. Never
+                claim that a device changed unless the tool reports success. Never
+                invent a point ID. If a name is ambiguous, ask the user to choose
+                from the matches returned by the tool.
+                A spoken multi-gang name such as "switch 3 one" means the single
+                point "Sw3 - 1". Keep the device and gang together in one tool call;
+                never split them into "switch 3" and "switch 1" calls.
+                For a fan, use increase_fan_speed or decrease_fan_speed for relative
+                changes. A requested fan speed or level from 1 to 4 means
+                set_fan_speed with that exact value; never convert it to brightness.
+                If the user names a device such as Sw2 in a fan-speed request, pass
+                Sw2 as point_name; the tool will select its fan-capable point. Do not
+                reinterpret Sw2 as the gang points Sw21 or Sw22.
                 Reply in the same language as the user's current question, independent
                 of earlier turns. If the user explicitly requests English or Kannada,
                 use the requested language instead.
@@ -434,6 +511,119 @@ class Assistant(Agent):
         logger.info("TOOL RESULT: search_database %s", result)
         return result
 
+    async def _automation_call(self, operation: Awaitable[str]) -> str:
+        try:
+            result = await operation
+        except GeckoLinkError as error:
+            result = str(error)
+        except Exception:
+            logger.exception("GeckoLink automation tool failed")
+            result = "The automation request failed unexpectedly. Please try again."
+        logger.info("TOOL RESULT: geckolink %s", result)
+        return result
+
+    @function_tool
+    async def find_automation_points(self, query: str = "", room: str = "") -> str:
+        """Find GeckoLink switches, lights, or other controllable points by name.
+
+        Use this before control when the user gives an unclear point name, or
+        when the user asks which devices are available.
+
+        Args:
+            query: Optional point or device name to search for.
+            room: Optional room name used to narrow the search.
+        """
+        logger.info("TOOL CALL: find_automation_points query=%s room=%s", query, room)
+        if self._geckolink is None:
+            return "GeckoLink automation is not connected."
+        return await self._automation_call(self._geckolink.find_points(query, room))
+
+    @function_tool
+    async def control_automation_point(
+        self,
+        point_name: str,
+        action: Literal[
+            "on",
+            "off",
+            "toggle",
+            "set_brightness",
+            "increase_fan_speed",
+            "decrease_fan_speed",
+            "set_fan_speed",
+        ],
+        room: str = "",
+        brightness: int | None = None,
+        fan_speed: int | None = None,
+    ) -> str:
+        """Control one existing GeckoLink point such as a switch or light.
+
+        Args:
+            point_name: Human-friendly point name, such as ceiling light.
+            action: Turn on/off, toggle, set brightness, increase/decrease fan
+                speed, or set an exact fan speed.
+            room: Optional room name to disambiguate duplicate point names.
+            brightness: Required only for set_brightness; integer from 0 to 100.
+            fan_speed: Required only for set_fan_speed; integer from 1 to 4.
+        """
+        logger.info(
+            "TOOL CALL: control_automation_point point=%s action=%s room=%s brightness=%s fan_speed=%s",
+            point_name,
+            action,
+            room,
+            brightness,
+            fan_speed,
+        )
+        if self._geckolink is None:
+            return "GeckoLink automation is not connected."
+        return await self._automation_call(
+            self._geckolink.control_point(
+                point_name, action, room, brightness, fan_speed
+            )
+        )
+
+    @function_tool
+    async def get_automation_point_status(self, point_name: str, room: str = "") -> str:
+        """Get the live on, off, availability, and brightness status of a point.
+
+        Args:
+            point_name: Human-friendly point name.
+            room: Optional room name to disambiguate duplicate point names.
+        """
+        logger.info(
+            "TOOL CALL: get_automation_point_status point=%s room=%s",
+            point_name,
+            room,
+        )
+        if self._geckolink is None:
+            return "GeckoLink automation is not connected."
+        return await self._automation_call(
+            self._geckolink.point_status(point_name, room)
+        )
+
+    @function_tool
+    async def activate_automation_scene(self, scene_name: str) -> str:
+        """Activate an existing GeckoLink scene by its human-friendly name.
+
+        Args:
+            scene_name: Existing scene name, such as Movie Night.
+        """
+        logger.info("TOOL CALL: activate_automation_scene scene=%s", scene_name)
+        if self._geckolink is None:
+            return "GeckoLink automation is not connected."
+        return await self._automation_call(self._geckolink.activate_scene(scene_name))
+
+    @function_tool
+    async def activate_automation_mood(self, mood_name: str) -> str:
+        """Activate an existing GeckoLink mood by its human-friendly name.
+
+        Args:
+            mood_name: Existing mood name, such as Relax.
+        """
+        logger.info("TOOL CALL: activate_automation_mood mood=%s", mood_name)
+        if self._geckolink is None:
+            return "GeckoLink automation is not connected."
+        return await self._automation_call(self._geckolink.activate_mood(mood_name))
+
     async def on_user_turn_completed(self, turn_ctx, new_message):
         user_text = (new_message.raw_text_content or "").strip()
         if not self.consume_button_arm():
@@ -540,6 +730,9 @@ async def my_agent(ctx: agents.JobContext):
         ),
     )
     loop = asyncio.get_running_loop()
+    background_tasks: set[asyncio.Task[Any]] = set()
+    geckolink_transport = RoomGeckoLinkTransport(ctx.room)
+    geckolink_client = GeckoLinkClient(geckolink_transport.request)
 
     async def notify_mic_sleep() -> None:
         try:
@@ -553,7 +746,9 @@ async def my_agent(ctx: agents.JobContext):
 
     def enter_sleep() -> None:
         session.input.set_audio_enabled(False)
-        loop.create_task(notify_mic_sleep())
+        task = loop.create_task(notify_mic_sleep())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
         logger.info("STANDBY: audio input disabled; MIC1 sleep requested")
 
     session.input.set_audio_enabled(False)
@@ -562,6 +757,7 @@ async def my_agent(ctx: agents.JobContext):
         english_tts,
         kannada_tts,
         on_sleep=enter_sleep,
+        geckolink=geckolink_client,
     )
     arm_timeout: asyncio.TimerHandle | None = None
 
@@ -590,7 +786,9 @@ async def my_agent(ctx: agents.JobContext):
         try:
             payload = json.loads(packet.data.decode("utf-8"))
         except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
-            logger.warning("PUSH BUTTON: ignored invalid control packet")
+            logger.warning("CONTROL: ignored invalid data packet")
+            return
+        if geckolink_transport.handle_response(payload):
             return
         if payload.get("type") == BUTTON_EVENT_TYPE:
             speech = session.current_speech
@@ -600,9 +798,7 @@ async def my_agent(ctx: agents.JobContext):
             assistant.arm_from_button()
             session.input.set_audio_enabled(True)
             cancel_arm_timeout()
-            arm_timeout = loop.call_later(
-                BUTTON_SPEECH_TIMEOUT, expire_silent_arm
-            )
+            arm_timeout = loop.call_later(BUTTON_SPEECH_TIMEOUT, expire_silent_arm)
 
     @session.on("user_state_changed")
     def on_user_state_changed(event):

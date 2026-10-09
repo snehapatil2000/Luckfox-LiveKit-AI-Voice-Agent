@@ -1,7 +1,10 @@
+import asyncio
+import json
+
 from livekit.agents import llm
 
 import agent as agent_module
-from agent import Assistant
+from agent import Assistant, RoomGeckoLinkTransport
 
 
 def _tool(assistant: Assistant, name: str) -> llm.FunctionTool:
@@ -20,13 +23,47 @@ def test_all_function_tools_are_registered() -> None:
         for tool in Assistant(None).tools
         if isinstance(tool, llm.FunctionTool)
     }
-
     assert tool_names == {
         "calculator",
         "get_current_time",
         "get_weather",
         "search_database",
+        "find_automation_points",
+        "control_automation_point",
+        "get_automation_point_status",
+        "activate_automation_scene",
+        "activate_automation_mood",
     }
+
+
+async def test_geckolink_transport_correlates_board_response() -> None:
+    class FakeParticipant:
+        packet = None
+
+        async def publish_data(self, data, **_kwargs):
+            self.packet = json.loads(data)
+
+    class FakeRoom:
+        local_participant = FakeParticipant()
+
+    room = FakeRoom()
+    transport = RoomGeckoLinkTransport(room)
+    request = asyncio.create_task(
+        transport.request("GET", "/api/v1/points", None)
+    )
+    await asyncio.sleep(0)
+    assert room.local_participant.packet["type"] == "geckolink_request"
+
+    transport.handle_response(
+        {
+            "type": "geckolink_response",
+            "request_id": room.local_participant.packet["request_id"],
+            "status": 200,
+            "body": {"data": {"points": []}},
+        }
+    )
+
+    assert await request == {"data": {"points": []}}
 
 
 async def test_calculator_adds_numbers() -> None:

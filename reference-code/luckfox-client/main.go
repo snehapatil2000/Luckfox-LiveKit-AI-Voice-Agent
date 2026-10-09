@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,23 +27,27 @@ import (
 )
 
 const (
-	sampleRate     = 48000
-	inputChannels  = 2
-	outputChannels = 2
-	frameMillis    = 20
-	buttonValue    = "/sys/class/gpio/gpio42/value"
-	buttonTopic    = "luckfox-control"
-	micSleepEvent  = "mic_sleep"
-	buttonPoll     = 10 * time.Millisecond
-	buttonDebounce = 40 * time.Millisecond
-	buttonPullReg  = "0xff5381c4"
-	buttonPullUp   = "0x300010"
+	sampleRate         = 48000
+	inputChannels      = 2
+	outputChannels     = 2
+	frameMillis        = 20
+	buttonValue        = "/sys/class/gpio/gpio42/value"
+	buttonTopic        = "luckfox-control"
+	micSleepEvent      = "mic_sleep"
+	geckoRequestEvent  = "geckolink_request"
+	geckoResponseEvent = "geckolink_response"
+	buttonPoll         = 10 * time.Millisecond
+	buttonDebounce     = 40 * time.Millisecond
+	buttonPullReg      = "0xff5381c4"
+	buttonPullUp       = "0x300010"
 )
 
 type config struct {
-	URL, APIKey, APISecret, Token string
-	Room, Identity, AgentName     string
-	CaptureDevice, PlaybackDevice string
+	URL, APIKey, APISecret, Token        string
+	Room, Identity, AgentName            string
+	CaptureDevice, PlaybackDevice        string
+	GeckoLinkURL, GeckoLinkToken         string
+	GeckoLinkUsername, GeckoLinkPassword string
 }
 
 func env(name, fallback string) string {
@@ -52,15 +59,19 @@ func env(name, fallback string) string {
 
 func loadConfig() (config, error) {
 	c := config{
-		URL:            os.Getenv("LIVEKIT_URL"),
-		APIKey:         os.Getenv("LIVEKIT_API_KEY"),
-		APISecret:      os.Getenv("LIVEKIT_API_SECRET"),
-		Token:          os.Getenv("LIVEKIT_TOKEN"),
-		Room:           env("LIVEKIT_ROOM", "luckfox-voice"),
-		Identity:       env("LIVEKIT_IDENTITY", "luckfox-board"),
-		AgentName:      env("LIVEKIT_AGENT_NAME", "my-agent"),
-		CaptureDevice:  env("CAPTURE_DEVICE", "hw:0,0"),
-		PlaybackDevice: env("PLAYBACK_DEVICE", "hw:0,0"),
+		URL:               os.Getenv("LIVEKIT_URL"),
+		APIKey:            os.Getenv("LIVEKIT_API_KEY"),
+		APISecret:         os.Getenv("LIVEKIT_API_SECRET"),
+		Token:             os.Getenv("LIVEKIT_TOKEN"),
+		Room:              env("LIVEKIT_ROOM", "luckfox-voice"),
+		Identity:          env("LIVEKIT_IDENTITY", "luckfox-board"),
+		AgentName:         env("LIVEKIT_AGENT_NAME", "my-agent"),
+		CaptureDevice:     env("CAPTURE_DEVICE", "hw:0,0"),
+		PlaybackDevice:    env("PLAYBACK_DEVICE", "hw:0,0"),
+		GeckoLinkURL:      os.Getenv("GECKOLINK_URL"),
+		GeckoLinkToken:    os.Getenv("GECKOLINK_TOKEN"),
+		GeckoLinkUsername: os.Getenv("GECKOLINK_USERNAME"),
+		GeckoLinkPassword: os.Getenv("GECKOLINK_PASSWORD"),
 	}
 	if c.URL == "" {
 		return c, errors.New("LIVEKIT_URL is required")
@@ -144,6 +155,200 @@ func ensureAgent(c config) error {
 	}
 	fmt.Printf("Dispatched agent %s\n", c.AgentName)
 	return nil
+}
+
+var (
+	pointActionPath = regexp.MustCompile(`^/api/v1/points/[0-9A-Fa-f:]+/(on|off|toggle|set|fan/toggle|fan/speed/(up|down|set))$`)
+	groupActionPath = regexp.MustCompile(`^/api/v1/(scenes|moods)/[0-9]+/activate$`)
+)
+
+type geckoLinkRequest struct {
+	Type      string          `json:"type"`
+	RequestID string          `json:"request_id"`
+	Method    string          `json:"method"`
+	Path      string          `json:"path"`
+	Body      json.RawMessage `json:"body"`
+}
+
+type geckoLinkResponse struct {
+	Type      string `json:"type"`
+	RequestID string `json:"request_id"`
+	Status    int    `json:"status"`
+	Body      any    `json:"body,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+type automationBridge struct {
+	baseURL     string
+	token       string
+	username    string
+	password    string
+	authMu      sync.Mutex
+	client      *http.Client
+	participant *lksdk.LocalParticipant
+}
+
+func newAutomationBridge(c config, participant *lksdk.LocalParticipant) *automationBridge {
+	return &automationBridge{
+		baseURL:     strings.TrimRight(c.GeckoLinkURL, "/"),
+		token:       c.GeckoLinkToken,
+		username:    c.GeckoLinkUsername,
+		password:    c.GeckoLinkPassword,
+		client:      &http.Client{Timeout: 12 * time.Second},
+		participant: participant,
+	}
+}
+
+func (b *automationBridge) accessToken(forceLogin bool) (string, error) {
+	b.authMu.Lock()
+	defer b.authMu.Unlock()
+	if !forceLogin && b.token != "" {
+		return b.token, nil
+	}
+	if b.username == "" || b.password == "" {
+		return "", errors.New("GECKOLINK_TOKEN or GECKOLINK_USERNAME and GECKOLINK_PASSWORD are required")
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"identifier": b.username,
+		"password":   b.password,
+		"rememberMe": true,
+	})
+	response, err := b.client.Post(b.baseURL+"/api/v1/auth/login", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return "", fmt.Errorf("GeckoLink login failed: %w", err)
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return "", fmt.Errorf("cannot read GeckoLink login response: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return "", fmt.Errorf("GeckoLink login returned HTTP %d", response.StatusCode)
+	}
+	var result struct {
+		AccessToken string `json:"accessToken"`
+		Token       string `json:"token"`
+		Data        struct {
+			AccessToken string `json:"access_token"`
+		} `json:"data"`
+	}
+	if err = json.Unmarshal(data, &result); err != nil {
+		return "", fmt.Errorf("invalid GeckoLink login response: %w", err)
+	}
+	if result.AccessToken == "" {
+		result.AccessToken = result.Token
+	}
+	if result.AccessToken == "" {
+		result.AccessToken = result.Data.AccessToken
+	}
+	if result.AccessToken == "" {
+		return "", errors.New("GeckoLink login response has no access token")
+	}
+	b.token = result.AccessToken
+	return b.token, nil
+}
+
+func (b *automationBridge) request(request geckoLinkRequest) (int, []byte, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		token, err := b.accessToken(attempt > 0)
+		if err != nil {
+			return 0, nil, err
+		}
+		var body io.Reader
+		if len(request.Body) > 0 && string(request.Body) != "null" {
+			body = bytes.NewReader(request.Body)
+		}
+		httpRequest, err := http.NewRequest(strings.ToUpper(request.Method), b.baseURL+request.Path, body)
+		if err != nil {
+			return 0, nil, err
+		}
+		httpRequest.Header.Set("Authorization", "Bearer "+token)
+		httpRequest.Header.Set("Accept", "application/json")
+		if body != nil {
+			httpRequest.Header.Set("Content-Type", "application/json")
+		}
+		httpResponse, err := b.client.Do(httpRequest)
+		if err != nil {
+			return 0, nil, fmt.Errorf("cannot reach GeckoLink gateway: %w", err)
+		}
+		data, readErr := io.ReadAll(io.LimitReader(httpResponse.Body, 1<<20))
+		httpResponse.Body.Close()
+		if readErr != nil {
+			return 0, nil, fmt.Errorf("cannot read GeckoLink response: %w", readErr)
+		}
+		if httpResponse.StatusCode != http.StatusUnauthorized || b.username == "" || b.password == "" {
+			return httpResponse.StatusCode, data, nil
+		}
+	}
+	return http.StatusUnauthorized, nil, errors.New("GeckoLink authentication failed after retry")
+}
+
+func isAllowedAutomationRequest(method, path string) bool {
+	method = strings.ToUpper(method)
+	if method == http.MethodGet {
+		switch path {
+		case "/api/v1/points", "/api/v1/rooms", "/api/v1/scenes", "/api/v1/moods":
+			return true
+		}
+	}
+	return method == http.MethodPost && (pointActionPath.MatchString(path) || groupActionPath.MatchString(path))
+}
+
+func (b *automationBridge) publish(response geckoLinkResponse, destination string) {
+	payload, err := json.Marshal(response)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "GeckoLink response encoding error: %v\n", err)
+		return
+	}
+	if err = b.participant.PublishDataPacket(
+		lksdk.UserData(payload),
+		lksdk.WithDataPublishTopic(buttonTopic),
+		lksdk.WithDataPublishReliable(true),
+		lksdk.WithDataPublishDestination([]string{destination}),
+	); err != nil {
+		fmt.Fprintf(os.Stderr, "GeckoLink response publish error: %v\n", err)
+	}
+}
+
+func (b *automationBridge) handle(payload []byte, destination string) {
+	var request geckoLinkRequest
+	if err := json.Unmarshal(payload, &request); err != nil || request.Type != geckoRequestEvent {
+		return
+	}
+	response := geckoLinkResponse{Type: geckoResponseEvent, RequestID: request.RequestID}
+	if request.RequestID == "" {
+		return
+	}
+	if b.baseURL == "" || (b.token == "" && (b.username == "" || b.password == "")) {
+		response.Status = http.StatusServiceUnavailable
+		response.Error = "GeckoLink URL and credentials are not configured on Luckfox"
+		b.publish(response, destination)
+		return
+	}
+	if !isAllowedAutomationRequest(request.Method, request.Path) {
+		response.Status = http.StatusForbidden
+		response.Error = "automation endpoint is not allowed"
+		b.publish(response, destination)
+		return
+	}
+
+	status, data, err := b.request(request)
+	if err != nil {
+		response.Status = http.StatusBadGateway
+		response.Error = err.Error()
+		b.publish(response, destination)
+		return
+	}
+	response.Status = status
+	if len(data) > 0 {
+		if err = json.Unmarshal(data, &response.Body); err != nil {
+			response.Body = map[string]any{"message": string(data)}
+		}
+	} else {
+		response.Body = map[string]any{}
+	}
+	b.publish(response, destination)
+	fmt.Printf("GeckoLink %s %s -> %d\n", request.Method, request.Path, response.Status)
 }
 
 type captureController struct {
@@ -379,16 +584,26 @@ func run() error {
 
 	var room *lksdk.Room
 	var capture *captureController
+	var automation *automationBridge
 	callbacks.ParticipantCallback.OnDataPacket = func(data lksdk.DataPacket, params lksdk.DataReceiveParams) {
 		packet, ok := data.(*lksdk.UserDataPacket)
-		if !ok || packet.Topic != buttonTopic || capture == nil {
+		if !ok || packet.Topic != buttonTopic {
 			return
 		}
 		var control struct {
 			Type string `json:"type"`
 		}
-		if json.Unmarshal(packet.Payload, &control) == nil && control.Type == micSleepEvent {
+		if json.Unmarshal(packet.Payload, &control) != nil {
+			return
+		}
+		if params.Sender == nil || params.Sender.Kind() != lksdk.ParticipantAgent {
+			fmt.Fprintf(os.Stderr, "Ignored control packet from non-agent participant %s\n", params.SenderIdentity)
+			return
+		}
+		if control.Type == micSleepEvent && capture != nil {
 			capture.Stop()
+		} else if control.Type == geckoRequestEvent && automation != nil {
+			go automation.handle(packet.Payload, params.SenderIdentity)
 		}
 	}
 	if c.Token != "" {
@@ -403,6 +618,12 @@ func run() error {
 	}
 	defer room.Disconnect()
 	fmt.Printf("Connected to LiveKit room %s\n", c.Room)
+	automation = newAutomationBridge(c, room.LocalParticipant)
+	if c.GeckoLinkURL == "" || (c.GeckoLinkToken == "" && (c.GeckoLinkUsername == "" || c.GeckoLinkPassword == "")) {
+		fmt.Println("GeckoLink voice tools disabled: set URL and token or username/password")
+	} else {
+		fmt.Printf("GeckoLink voice bridge ready for %s\n", c.GeckoLinkURL)
+	}
 	if err = ensureAgent(c); err != nil {
 		return err
 	}

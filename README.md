@@ -16,16 +16,25 @@ User -> Luckfox microphone -> LiveKit Cloud -> Python agent
                                              +-> Sarvam Saaras v4 STT
                                              +-> DeepSeek V4 Flash LLM
                                              +-> Sarvam Bulbul v3 TTS
+                                             +-> GeckoLink tool request
                                              |
 Luckfox headphones/speaker <- LiveKit Cloud <-+
+
+GeckoLink tool request -> LiveKit data -> Luckfox -> A20 GeckoLink REST API
+                         -> coordinator -> Zigbee switch/light
 ```
 
 - English: Sarvam Saaras STT -> DeepSeek -> Sarvam Bulbul `en-IN` TTS
 - Kannada: Sarvam Saaras STT -> DeepSeek -> Sarvam Bulbul `kn-IN` TTS
-- Wake phrase: **Hey Siri** at the start of every question
-- Barge-in: say **Hey Siri** plus a new question while an answer is playing
-- Tools: calculator, current time/date, live weather, and project information
+- Activation: press the Luckfox push button to arm one question
+- Barge-in: press the button while an answer is playing, then ask the new question
+- Tools: calculator, time/date, weather, project information, and GeckoLink control
 - Startup: `/etc/init.d/S99zz-livekit-voice` starts the board client at boot
+
+The existing GeckoLink mobile-app path is unchanged. Users may control the
+same points either from the app or by voice. Voice control reuses GeckoLink's
+authenticated API and its existing point, room, scene, mood, coordinator, and
+Zigbee logic.
 
 ## Repository layout
 
@@ -87,7 +96,16 @@ From the repository root in PowerShell:
 ```
 
 Configure `/root/luckfox-livekit.env` on the board, set
-`LIVEKIT_AGENT_NAME=my-agent`, protect it with `chmod 600`, and restart:
+`LIVEKIT_AGENT_NAME=my-agent`, `GECKOLINK_URL` to the A20 voice-proxy URL
+(for example, `http://192.168.0.111:8889`), and `GECKOLINK_USERNAME` /
+`GECKOLINK_PASSWORD` to a dedicated GeckoLink user account. Protect the file
+with `chmod 600`. The client logs in again automatically when its token expires;
+`GECKOLINK_TOKEN` remains available for static-token deployments.
+
+The token needs only `points` read/control, `rooms` read, `scenes`
+read/control, and `moods` read/control permissions. Do not use an admin token.
+
+Restart the client:
 
 ```sh
 /etc/init.d/S99zz-livekit-voice restart
@@ -95,21 +113,20 @@ tail -f /root/luckfox-livekit.log
 ```
 
 Expected lines include `Connected to LiveKit room`, `Dispatched agent
-my-agent`, `Microphone is live`, and `Receiving voice from agent`.
+my-agent`, `Push button ready`, and `Receiving voice from agent`.
 
 ## Test
 
-Ask near the board:
+Press the push button once, then ask near the board:
 
 ```text
-Hey Siri, what time is it?
-Hey Siri, tell me the districts of Karnataka.
-Hey Siri, ಕರ್ನಾಟಕದ ಜಿಲ್ಲೆಗಳನ್ನು ಹೇಳು.
+What time is it?
+Turn on the living room ceiling light.
+ಲಿವಿಂಗ್ ರೂಮ್ ಲೈಟ್ ಆನ್ ಮಾಡಿ.
 ```
 
-Every independent question must include **Hey Siri**. During a long answer,
-say **Hey Siri** followed by the next question to stop the old reply and start
-the new one.
+Each independent question needs a button press. During a long answer, press
+the button again and ask the next question to stop the old reply.
 
 ## Logs
 
@@ -126,8 +143,20 @@ lk agent logs --id <cloud-agent-id> --project <project-name> --log-type deploy
 ```
 
 Cloud logs show `VOICE USER`, `VOICE ASSISTANT`, `VOICE STATE`, tool calls,
-wake-word decisions, and Sarvam WebSocket status. Board logs do not contain
+button decisions, and Sarvam WebSocket status. Board logs do not contain
 the complete speech transcript.
+
+## GeckoLink voice control
+
+The cloud agent cannot directly reach the A20 board's private LAN address.
+For an automation tool call, it sends a structured request over the existing
+LiveKit data channel. The Luckfox client checks the request against a strict
+allowlist, adds the bearer token locally, calls the A20 GeckoLink REST API,
+and returns the result. The token never enters the LLM prompt.
+
+Allowed voice operations are point discovery/status, on/off/toggle,
+brightness from 0 to 100, and activation of existing scenes and moods.
+Pairing, deletion, renaming, and account administration remain app-only.
 
 ## Security
 
