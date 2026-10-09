@@ -46,7 +46,7 @@ type config struct {
 	URL, APIKey, APISecret, Token        string
 	Room, Identity, AgentName            string
 	CaptureDevice, PlaybackDevice        string
-	GeckoLinkURL, GeckoLinkToken         string
+	GeckoLinkToken                       string
 	GeckoLinkUsername, GeckoLinkPassword string
 }
 
@@ -68,7 +68,6 @@ func loadConfig() (config, error) {
 		AgentName:         env("LIVEKIT_AGENT_NAME", "my-agent"),
 		CaptureDevice:     env("CAPTURE_DEVICE", "hw:0,0"),
 		PlaybackDevice:    env("PLAYBACK_DEVICE", "hw:0,0"),
-		GeckoLinkURL:      os.Getenv("GECKOLINK_URL"),
 		GeckoLinkToken:    os.Getenv("GECKOLINK_TOKEN"),
 		GeckoLinkUsername: os.Getenv("GECKOLINK_USERNAME"),
 		GeckoLinkPassword: os.Getenv("GECKOLINK_PASSWORD"),
@@ -179,7 +178,7 @@ type geckoLinkResponse struct {
 }
 
 type automationBridge struct {
-	baseURL     string
+	resolver    *gatewayResolver
 	token       string
 	username    string
 	password    string
@@ -190,7 +189,7 @@ type automationBridge struct {
 
 func newAutomationBridge(c config, participant *lksdk.LocalParticipant) *automationBridge {
 	return &automationBridge{
-		baseURL:     strings.TrimRight(c.GeckoLinkURL, "/"),
+		resolver:    newGatewayResolver(),
 		token:       c.GeckoLinkToken,
 		username:    c.GeckoLinkUsername,
 		password:    c.GeckoLinkPassword,
@@ -199,7 +198,7 @@ func newAutomationBridge(c config, participant *lksdk.LocalParticipant) *automat
 	}
 }
 
-func (b *automationBridge) accessToken(forceLogin bool) (string, error) {
+func (b *automationBridge) accessToken(baseURL string, forceLogin bool) (string, error) {
 	b.authMu.Lock()
 	defer b.authMu.Unlock()
 	if !forceLogin && b.token != "" {
@@ -213,7 +212,7 @@ func (b *automationBridge) accessToken(forceLogin bool) (string, error) {
 		"password":   b.password,
 		"rememberMe": true,
 	})
-	response, err := b.client.Post(b.baseURL+"/api/v1/auth/login", "application/json", bytes.NewReader(payload))
+	response, err := b.client.Post(baseURL+"/api/v1/auth/login", "application/json", bytes.NewReader(payload))
 	if err != nil {
 		return "", fmt.Errorf("GeckoLink login failed: %w", err)
 	}
@@ -249,38 +248,49 @@ func (b *automationBridge) accessToken(forceLogin bool) (string, error) {
 }
 
 func (b *automationBridge) request(request geckoLinkRequest) (int, []byte, error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		token, err := b.accessToken(attempt > 0)
+	for addressAttempt := 0; addressAttempt < 2; addressAttempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		baseURL, err := b.resolver.URL(ctx, addressAttempt > 0)
+		cancel()
 		if err != nil {
 			return 0, nil, err
 		}
-		var body io.Reader
-		if len(request.Body) > 0 && string(request.Body) != "null" {
-			body = bytes.NewReader(request.Body)
-		}
-		httpRequest, err := http.NewRequest(strings.ToUpper(request.Method), b.baseURL+request.Path, body)
-		if err != nil {
-			return 0, nil, err
-		}
-		httpRequest.Header.Set("Authorization", "Bearer "+token)
-		httpRequest.Header.Set("Accept", "application/json")
-		if body != nil {
-			httpRequest.Header.Set("Content-Type", "application/json")
-		}
-		httpResponse, err := b.client.Do(httpRequest)
-		if err != nil {
-			return 0, nil, fmt.Errorf("cannot reach GeckoLink gateway: %w", err)
-		}
-		data, readErr := io.ReadAll(io.LimitReader(httpResponse.Body, 1<<20))
-		httpResponse.Body.Close()
-		if readErr != nil {
-			return 0, nil, fmt.Errorf("cannot read GeckoLink response: %w", readErr)
-		}
-		if httpResponse.StatusCode != http.StatusUnauthorized || b.username == "" || b.password == "" {
-			return httpResponse.StatusCode, data, nil
+		for authAttempt := 0; authAttempt < 2; authAttempt++ {
+			token, tokenErr := b.accessToken(baseURL, authAttempt > 0)
+			if tokenErr != nil {
+				return 0, nil, tokenErr
+			}
+			var body io.Reader
+			if len(request.Body) > 0 && string(request.Body) != "null" {
+				body = bytes.NewReader(request.Body)
+			}
+			httpRequest, requestErr := http.NewRequest(strings.ToUpper(request.Method), baseURL+request.Path, body)
+			if requestErr != nil {
+				return 0, nil, requestErr
+			}
+			httpRequest.Header.Set("Authorization", "Bearer "+token)
+			httpRequest.Header.Set("Accept", "application/json")
+			if body != nil {
+				httpRequest.Header.Set("Content-Type", "application/json")
+			}
+			httpResponse, requestErr := b.client.Do(httpRequest)
+			if requestErr != nil {
+				if addressAttempt == 0 {
+					break
+				}
+				return 0, nil, fmt.Errorf("cannot reach GeckoLink gateway: %w", requestErr)
+			}
+			data, readErr := io.ReadAll(io.LimitReader(httpResponse.Body, 1<<20))
+			httpResponse.Body.Close()
+			if readErr != nil {
+				return 0, nil, fmt.Errorf("cannot read GeckoLink response: %w", readErr)
+			}
+			if httpResponse.StatusCode != http.StatusUnauthorized || b.username == "" || b.password == "" {
+				return httpResponse.StatusCode, data, nil
+			}
 		}
 	}
-	return http.StatusUnauthorized, nil, errors.New("GeckoLink authentication failed after retry")
+	return 0, nil, errors.New("cannot reach GeckoLink gateway after refreshing its IP")
 }
 
 func isAllowedAutomationRequest(method, path string) bool {
@@ -319,9 +329,9 @@ func (b *automationBridge) handle(payload []byte, destination string) {
 	if request.RequestID == "" {
 		return
 	}
-	if b.baseURL == "" || (b.token == "" && (b.username == "" || b.password == "")) {
+	if b.token == "" && (b.username == "" || b.password == "") {
 		response.Status = http.StatusServiceUnavailable
-		response.Error = "GeckoLink URL and credentials are not configured on Luckfox"
+		response.Error = "GeckoLink credentials are not configured on Luckfox"
 		b.publish(response, destination)
 		return
 	}
@@ -619,10 +629,17 @@ func run() error {
 	defer room.Disconnect()
 	fmt.Printf("Connected to LiveKit room %s\n", c.Room)
 	automation = newAutomationBridge(c, room.LocalParticipant)
-	if c.GeckoLinkURL == "" || (c.GeckoLinkToken == "" && (c.GeckoLinkUsername == "" || c.GeckoLinkPassword == "")) {
-		fmt.Println("GeckoLink voice tools disabled: set URL and token or username/password")
+	if c.GeckoLinkToken == "" && (c.GeckoLinkUsername == "" || c.GeckoLinkPassword == "") {
+		fmt.Println("GeckoLink voice tools disabled: set token or username/password")
 	} else {
-		fmt.Printf("GeckoLink voice bridge ready for %s\n", c.GeckoLinkURL)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		gatewayURL, resolveErr := automation.resolver.URL(ctx, true)
+		cancel()
+		if resolveErr != nil {
+			fmt.Printf("GeckoLink gateway %s is not currently reachable; commands will retry MAC resolution: %v\n", geckoLinkGatewayMAC, resolveErr)
+		} else {
+			fmt.Printf("GeckoLink voice bridge ready for gateway %s at %s\n", geckoLinkGatewayMAC, gatewayURL)
+		}
 	}
 	if err = ensureAgent(c); err != nil {
 		return err

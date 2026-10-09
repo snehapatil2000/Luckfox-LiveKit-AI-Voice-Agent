@@ -96,9 +96,10 @@ From the repository root in PowerShell:
 ```
 
 Configure `/root/luckfox-livekit.env` on the board, set
-`LIVEKIT_AGENT_NAME=my-agent`, `GECKOLINK_URL` to the A20 voice-proxy URL
-(for example, `http://192.168.0.111:8889`), and `GECKOLINK_USERNAME` /
-`GECKOLINK_PASSWORD` to a dedicated GeckoLink user account. Protect the file
+`LIVEKIT_AGENT_NAME=my-agent` and `GECKOLINK_USERNAME` /
+`GECKOLINK_PASSWORD` to a dedicated GeckoLink user account. The client identifies
+the A20 by its fixed MAC `30:1F:9A:D1:45:49` and refreshes its current LAN IP
+automatically; no gateway IP is configured. Protect the file
 with `chmod 600`. The client logs in again automatically when its token expires;
 `GECKOLINK_TOKEN` remains available for static-token deployments.
 

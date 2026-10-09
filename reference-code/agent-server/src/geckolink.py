@@ -56,6 +56,14 @@ def _supports(capabilities: Any, name: str) -> bool:
     return True
 
 
+def _point_supports(point: dict[str, Any], name: str) -> bool:
+    """Use live state when older gateways omit a capability declaration."""
+    state = point.get("state")
+    if isinstance(state, dict) and name in state:
+        return True
+    return _supports(point.get("capabilities"), name)
+
+
 class GeckoLinkClient:
     """Resolve human names, then call a restricted GeckoLink API transport."""
 
@@ -149,7 +157,7 @@ class GeckoLinkClient:
             capable_matches = [
                 point
                 for point in matches
-                if _supports(point.get("capabilities"), capability)
+                if _point_supports(point, capability)
             ]
             if capable_matches:
                 matches = capable_matches
@@ -236,7 +244,7 @@ class GeckoLinkClient:
 
         capabilities = point.get("capabilities")
         if action in fan_actions:
-            if capabilities and not _supports(capabilities, "fan_speed"):
+            if capabilities and not _point_supports(point, "fan_speed"):
                 raise GeckoLinkError(f"{point.get('name')} does not support fan speed.")
             if action == "set_fan_speed":
                 if fan_speed is None or not 1 <= fan_speed <= 4:
@@ -254,7 +262,7 @@ class GeckoLinkClient:
         elif action == "set_brightness":
             if brightness is None or not 0 <= brightness <= 100:
                 raise GeckoLinkError("Brightness must be between 0 and 100 percent.")
-            if capabilities and not _supports(capabilities, "brightness"):
+            if capabilities and not _point_supports(point, "brightness"):
                 raise GeckoLinkError(
                     f"{point.get('name')} does not support brightness."
                 )

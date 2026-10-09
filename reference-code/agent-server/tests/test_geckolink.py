@@ -60,7 +60,9 @@ class FakeGateway:
                             "device_name": "Sw2",
                             "room_id": 3,
                             "enabled": True,
-                            "capabilities": ["on_off", "fan_speed"],
+                            # Older GeckoLink responses omit fan_speed here,
+                            # while the live state still proves support.
+                            "capabilities": ["on_off"],
                             "state": {"available": True, "on": True, "fan_speed": 2},
                         },
                     ]

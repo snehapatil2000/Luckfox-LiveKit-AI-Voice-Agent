@@ -57,7 +57,7 @@ func TestAutomationBridgeLogsInAndRetriesExpiredToken(t *testing.T) {
 	defer server.Close()
 
 	bridge := &automationBridge{
-		baseURL:  server.URL,
+		resolver: staticGatewayResolver(server.URL),
 		token:    "expired-token",
 		username: "voice_agent",
 		password: "secret",
