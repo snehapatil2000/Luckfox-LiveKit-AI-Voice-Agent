@@ -136,7 +136,13 @@ async def test_sets_brightness_from_zero_to_one_hundred() -> None:
     [
         ("increase_fan_speed", None, "up", {}, "increased by one level"),
         ("decrease_fan_speed", None, "down", {}, "decreased by one level"),
-        ("set_fan_speed", 3, "set", {"speed": 3}, "set to fan speed 3"),
+        (
+            "set_fan_speed",
+            3,
+            "set",
+            {"speed": 3},
+            "set to fan speed 3",
+        ),
     ],
 )
 async def test_controls_fan_speed(action, speed, endpoint, body, spoken) -> None:
@@ -148,7 +154,11 @@ async def test_controls_fan_speed(action, speed, endpoint, body, spoken) -> None
     assert result == f"Fan in Hall was {spoken}."
     assert gateway.calls[-1] == (
         "POST",
-        f"/api/v1/points/fan:3/fan/speed/{endpoint}",
+        (
+            "/api/v1/points/fan:3/fan/speed/set"
+            if action == "set_fan_speed"
+            else f"/api/v1/points/fan:3/fan/speed/{endpoint}"
+        ),
         body,
     )
 

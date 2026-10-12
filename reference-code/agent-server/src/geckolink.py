@@ -243,6 +243,8 @@ class GeckoLinkClient:
             raise GeckoLinkError(f"{point.get('name')} is currently unavailable.")
 
         capabilities = point.get("capabilities")
+        endpoint: str
+        body: dict[str, Any]
         if action in fan_actions:
             if capabilities and not _point_supports(point, "fan_speed"):
                 raise GeckoLinkError(f"{point.get('name')} does not support fan speed.")

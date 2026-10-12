@@ -257,6 +257,10 @@ class Assistant(Agent):
                 claim that a device changed unless the tool reports success. Never
                 invent a point ID. If a name is ambiguous, ask the user to choose
                 from the matches returned by the tool.
+                After controlling one point, report only that tool's result. Do not
+                infer or announce the state of sibling switches, fans, or other
+                points from conversation history. If the user asks for their state,
+                call get_automation_point_status for each requested point first.
                 A spoken multi-gang name such as "switch 3 one" means the single
                 point "Sw3 - 1". Keep the device and gang together in one tool call;
                 never split them into "switch 3" and "switch 1" calls.
