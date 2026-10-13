@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -27,27 +29,43 @@ import (
 )
 
 const (
-	sampleRate         = 48000
-	inputChannels      = 2
+	sampleRate = 48000
+	// Use the same native mono capture format as the working wake listener.
+	inputChannels      = 1
 	outputChannels     = 2
 	frameMillis        = 20
-	buttonValue        = "/sys/class/gpio/gpio42/value"
-	buttonTopic        = "luckfox-control"
+	controlTopic       = "luckfox-control"
+	activationEvent    = "arm_question"
+	interruptEvent     = "interrupt_answer"
 	micSleepEvent      = "mic_sleep"
+	assistantSpeaking  = "assistant_speaking"
+	assistantListening = "assistant_listening"
 	geckoRequestEvent  = "geckolink_request"
 	geckoResponseEvent = "geckolink_response"
-	buttonPoll         = 10 * time.Millisecond
-	buttonDebounce     = 40 * time.Millisecond
-	buttonPullReg      = "0xff5381c4"
-	buttonPullUp       = "0x300010"
+	wakeSampleRate     = 16000
+	wakeWord           = "edison"
+	wakeBinary         = "/opt/luckfox-wakeword/luckfox-wakeword"
+	wakeModel          = "/opt/luckfox-wakeword/en-us/en-us"
+	wakeDictionary     = "/opt/luckfox-wakeword/en-us/cmudict-en-us.dict"
+	// Calibrated for one Edison followed by silence on MIC1. A threshold tuned
+	// for a longer phrase was too permissive for this single-word wake command.
+	wakeThreshold     = "1e-5"
+	workLEDTrigger    = "/sys/class/leds/work/trigger"
+	workLEDBrightness = "/sys/class/leds/work/brightness"
+	wakeBeepDuration  = 400 * time.Millisecond
+	// aplay buffers audio, so wait for the audible confirmation to finish
+	// before starting cloud capture and its 1.5-second question timer.
+	wakeBeepSettle = 600 * time.Millisecond
 )
 
 type config struct {
-	URL, APIKey, APISecret, Token        string
-	Room, Identity, AgentName            string
-	CaptureDevice, PlaybackDevice        string
-	GeckoLinkToken                       string
-	GeckoLinkUsername, GeckoLinkPassword string
+	URL, APIKey, APISecret, Token         string
+	Room, Identity, AgentName             string
+	CaptureDevice, PlaybackDevice         string
+	WakeCaptureDevice, WakeWord           string
+	WakeBinary, WakeModel, WakeDictionary string
+	GeckoLinkToken                        string
+	GeckoLinkUsername, GeckoLinkPassword  string
 }
 
 func env(name, fallback string) string {
@@ -59,15 +77,23 @@ func env(name, fallback string) string {
 
 func loadConfig() (config, error) {
 	c := config{
-		URL:               os.Getenv("LIVEKIT_URL"),
-		APIKey:            os.Getenv("LIVEKIT_API_KEY"),
-		APISecret:         os.Getenv("LIVEKIT_API_SECRET"),
-		Token:             os.Getenv("LIVEKIT_TOKEN"),
-		Room:              env("LIVEKIT_ROOM", "luckfox-voice"),
-		Identity:          env("LIVEKIT_IDENTITY", "luckfox-board"),
-		AgentName:         env("LIVEKIT_AGENT_NAME", "my-agent"),
-		CaptureDevice:     env("CAPTURE_DEVICE", "hw:0,0"),
+		URL:       os.Getenv("LIVEKIT_URL"),
+		APIKey:    os.Getenv("LIVEKIT_API_KEY"),
+		APISecret: os.Getenv("LIVEKIT_API_SECRET"),
+		Token:     os.Getenv("LIVEKIT_TOKEN"),
+		Room:      env("LIVEKIT_ROOM", "luckfox-voice"),
+		Identity:  env("LIVEKIT_IDENTITY", "luckfox-board"),
+		AgentName: env("LIVEKIT_AGENT_NAME", "my-agent"),
+		// plughw performs the board-specific format conversion and supports
+		// simultaneous MIC1 capture and speaker playback more reliably than
+		// the raw hw device.
+		CaptureDevice:     env("CAPTURE_DEVICE", "plughw:0,0"),
 		PlaybackDevice:    env("PLAYBACK_DEVICE", "hw:0,0"),
+		WakeCaptureDevice: env("WAKE_CAPTURE_DEVICE", "plughw:0,0"),
+		WakeWord:          strings.ToLower(env("WAKE_WORD", wakeWord)),
+		WakeBinary:        env("WAKEWORD_BINARY", wakeBinary),
+		WakeModel:         env("WAKEWORD_MODEL", wakeModel),
+		WakeDictionary:    env("WAKEWORD_DICTIONARY", wakeDictionary),
 		GeckoLinkToken:    os.Getenv("GECKOLINK_TOKEN"),
 		GeckoLinkUsername: os.Getenv("GECKOLINK_USERNAME"),
 		GeckoLinkPassword: os.Getenv("GECKOLINK_PASSWORD"),
@@ -86,29 +112,52 @@ type aplayWriter struct {
 	cmd    *exec.Cmd
 	in     io.WriteCloser
 	closed bool
+	muted  bool
+	device string
 }
 
 func newAplayWriter(device string) (*aplayWriter, error) {
-	cmd := exec.Command("aplay", "-q", "-D", device, "-t", "raw", "-f", "S16_LE", "-r", fmt.Sprint(sampleRate), "-c", fmt.Sprint(outputChannels))
+	w := &aplayWriter{device: device}
+	if err := w.startLocked(); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+func (w *aplayWriter) startLocked() error {
+	cmd := exec.Command("aplay", "-q", "-D", w.device, "-t", "raw", "-f", "S16_LE", "-r", fmt.Sprint(sampleRate), "-c", fmt.Sprint(outputChannels), "--buffer-time=100000", "--period-time=20000")
 	// The remote agent track is silent between replies. ALSA reports each
 	// resulting empty playback interval as an underrun, which would otherwise
 	// fill the device log even though later speech continues normally.
 	cmd.Stderr = io.Discard
 	in, err := cmd.StdinPipe()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err = cmd.Start(); err != nil {
-		return nil, err
+		return err
 	}
-	return &aplayWriter{cmd: cmd, in: in}, nil
+	w.cmd, w.in = cmd, in
+	return nil
 }
 
 func (w *aplayWriter) WriteSample(sample media.PCM16Sample) error {
+	return w.writeSample(sample, false)
+}
+
+func (w *aplayWriter) writeSample(sample media.PCM16Sample, acknowledgement bool) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
 		return io.ErrClosedPipe
+	}
+	if w.muted && !acknowledgement {
+		return nil
+	}
+	if w.in == nil {
+		if err := w.startLocked(); err != nil {
+			return err
+		}
 	}
 	buf := make([]byte, len(sample)*2)
 	for i, value := range sample {
@@ -118,6 +167,30 @@ func (w *aplayWriter) WriteSample(sample media.PCM16Sample) error {
 	return err
 }
 
+func (w *aplayWriter) Interrupt() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.muted = true
+	// Killing aplay also drops the old ALSA/pipe buffers. Further packets from
+	// the interrupted remote stream are discarded until the new answer starts.
+	if w.cmd != nil {
+		_ = w.cmd.Process.Kill()
+	}
+	if w.in != nil {
+		_ = w.in.Close()
+	}
+	if w.cmd != nil {
+		_ = w.cmd.Wait()
+	}
+	w.cmd, w.in = nil, nil
+}
+
+func (w *aplayWriter) Resume() {
+	w.mu.Lock()
+	w.muted = false
+	w.mu.Unlock()
+}
+
 func (w *aplayWriter) Close() error {
 	w.mu.Lock()
 	if w.closed {
@@ -125,9 +198,15 @@ func (w *aplayWriter) Close() error {
 		return nil
 	}
 	w.closed = true
-	err := w.in.Close()
+	var err error
+	if w.in != nil {
+		err = w.in.Close()
+	}
+	cmd := w.cmd
 	w.mu.Unlock()
-	_ = w.cmd.Wait()
+	if cmd != nil {
+		_ = cmd.Wait()
+	}
 	return err
 }
 
@@ -312,7 +391,7 @@ func (b *automationBridge) publish(response geckoLinkResponse, destination strin
 	}
 	if err = b.participant.PublishDataPacket(
 		lksdk.UserData(payload),
-		lksdk.WithDataPublishTopic(buttonTopic),
+		lksdk.WithDataPublishTopic(controlTopic),
 		lksdk.WithDataPublishReliable(true),
 		lksdk.WithDataPublishDestination([]string{destination}),
 	); err != nil {
@@ -362,19 +441,42 @@ func (b *automationBridge) handle(payload []byte, destination string) {
 }
 
 type captureController struct {
-	ctx    context.Context
-	track  *lkmedia.PCMLocalTrack
-	device string
-	errCh  chan error
-	mu     sync.Mutex
-	cancel context.CancelFunc
-	done   chan struct{}
+	ctx          context.Context
+	track        *lkmedia.PCMLocalTrack
+	device       string
+	errCh        chan error
+	mu           sync.Mutex
+	cancel       context.CancelFunc
+	done         chan struct{}
+	ready        chan struct{}
+	cloudEnabled bool
+	wakeSink     func([]byte) error
+}
+
+type microphoneDCBlocker struct {
+	initialized bool
+	previousIn  float64
+	previousOut float64
+}
+
+func (f *microphoneDCBlocker) Filter(value int16) int16 {
+	x := float64(value)
+	if !f.initialized {
+		f.initialized = true
+		f.previousIn = x
+		return 0
+	}
+	y := x - f.previousIn + 0.995*f.previousOut
+	f.previousIn, f.previousOut = x, y
+	return int16(math.Max(-32768, math.Min(32767, y)))
 }
 
 func newCaptureController(ctx context.Context, track *lkmedia.PCMLocalTrack, device string) *captureController {
 	return &captureController{ctx: ctx, track: track, device: device, errCh: make(chan error, 1)}
 }
 
+// Start owns MIC1 for the session. Corrected 16 kHz mono frames go to the
+// local wake detector in standby or to LiveKit during an armed question.
 func (c *captureController) Start() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -383,7 +485,7 @@ func (c *captureController) Start() error {
 	}
 
 	ctx, cancel := context.WithCancel(c.ctx)
-	cmd := exec.CommandContext(ctx, "arecord", "-q", "-D", c.device, "-t", "raw", "-f", "S16_LE", "-r", fmt.Sprint(sampleRate), "-c", fmt.Sprint(inputChannels))
+	cmd := exec.CommandContext(ctx, "arecord", "-q", "-D", c.device, "-t", "raw", "-f", "S16_LE", "-r", fmt.Sprint(wakeSampleRate), "-c", fmt.Sprint(inputChannels), "--buffer-time=1000000", "--period-time=20000")
 	cmd.Stderr = os.Stderr
 	out, err := cmd.StdoutPipe()
 	if err != nil {
@@ -395,16 +497,21 @@ func (c *captureController) Start() error {
 		return err
 	}
 	done := make(chan struct{})
+	ready := make(chan struct{})
 	c.cancel = cancel
 	c.done = done
-	fmt.Printf("MIC1 ON: capturing %s\n", c.device)
+	c.ready = ready
+	startedAt := time.Now()
+	fmt.Printf("MIC1 ON: continuous local capture from %s\n", c.device)
 
 	go func() {
 		defer close(done)
-		frameSamples := sampleRate * frameMillis / 1000
+		frameSamples := wakeSampleRate * frameMillis / 1000
 		raw := make([]byte, frameSamples*inputChannels*2)
 		mono := make(media.PCM16Sample, frameSamples)
 		var captureErr error
+		framesRead := 0
+		var dcBlocker microphoneDCBlocker
 		for {
 			_, readErr := io.ReadFull(out, raw)
 			if readErr != nil {
@@ -414,9 +521,41 @@ func (c *captureController) Start() error {
 				break
 			}
 			for i := 0; i < frameSamples; i++ {
-				left := int16(binary.LittleEndian.Uint16(raw[i*4:]))
-				right := int16(binary.LittleEndian.Uint16(raw[i*4+2:]))
-				mono[i] = int16((int32(left) + int32(right)) / 2)
+				value := int16(binary.LittleEndian.Uint16(raw[i*2:]))
+				mono[i] = dcBlocker.Filter(value)
+			}
+			if framesRead == 0 {
+				fmt.Printf("MIC1 READY: first PCM frame after %s\n", time.Since(startedAt))
+				close(ready)
+			}
+			framesRead++
+			if framesRead == 1 || framesRead%25 == 0 {
+				var sum, squares float64
+				for _, value := range mono {
+					v := float64(value)
+					sum += v
+					squares += v * v
+				}
+				mean := sum / float64(len(mono))
+				rms := math.Sqrt(math.Max(0, squares/float64(len(mono))-mean*mean))
+				fmt.Printf("MIC1 AUDIO: frames=%d format=16000Hz-mono mean=%.0f voice_rms=%.0f\n", framesRead, mean, rms)
+			}
+
+			c.mu.Lock()
+			cloudEnabled := c.cloudEnabled
+			wakeSink := c.wakeSink
+			c.mu.Unlock()
+			if wakeSink != nil && !cloudEnabled {
+				pcm := make([]byte, len(mono)*2)
+				for i, value := range mono {
+					binary.LittleEndian.PutUint16(pcm[i*2:], uint16(value))
+				}
+				if err := wakeSink(pcm); err != nil && ctx.Err() == nil {
+					fmt.Fprintf(os.Stderr, "wake audio input error: %v\n", err)
+				}
+			}
+			if !cloudEnabled {
+				continue
 			}
 			if writeErr := c.track.WriteSample(mono); writeErr != nil {
 				captureErr = fmt.Errorf("publish microphone: %w", writeErr)
@@ -438,7 +577,45 @@ func (c *captureController) Start() error {
 		}
 	}()
 	return nil
+}
 
+func (c *captureController) WaitReady(timeout time.Duration) error {
+	c.mu.Lock()
+	ready, done := c.ready, c.done
+	c.mu.Unlock()
+	if ready == nil || done == nil {
+		return errors.New("MIC1 capture has not started")
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ready:
+		return nil
+	case <-done:
+		return errors.New("MIC1 capture stopped before its first PCM frame")
+	case <-timer.C:
+		return errors.New("MIC1 did not supply a PCM frame before capture timeout")
+	}
+}
+
+func (c *captureController) SetCloudEnabled(enabled bool) {
+	c.mu.Lock()
+	changed := c.cloudEnabled != enabled
+	c.cloudEnabled = enabled
+	c.mu.Unlock()
+	if changed {
+		if enabled {
+			fmt.Println("MIC1 LISTEN: publishing question audio to LiveKit")
+		} else {
+			fmt.Println("MIC1 STANDBY: question audio is local only")
+		}
+	}
+}
+
+func (c *captureController) SetWakeSink(sink func([]byte) error) {
+	c.mu.Lock()
+	c.wakeSink = sink
+	c.mu.Unlock()
 }
 
 func (c *captureController) Stop() {
@@ -453,95 +630,359 @@ func (c *captureController) Stop() {
 	case <-done:
 	case <-time.After(time.Second):
 	}
-	fmt.Println("MIC1 OFF: standby")
+	fmt.Println("MIC1 OFF: continuous capture stopped")
 }
 
-func readButtonPressed() (bool, error) {
-	value, err := os.ReadFile(buttonValue)
-	if err != nil {
-		return false, err
-	}
-	// The installed normally-closed switch grounds GPIO42 while released and
-	// opens it when pressed, so its observed pressed level is HIGH.
-	return strings.TrimSpace(string(value)) == "1", nil
+type wakewordController struct {
+	ctx                             context.Context
+	participant                     *lksdk.LocalParticipant
+	capture                         *captureController
+	playBeep                        func()
+	interruptPlayback               func()
+	word, binary, model, dictionary string
+	errCh                           chan error
+	startMu                         sync.Mutex
+	mu                              sync.Mutex
+	cancel                          context.CancelFunc
+	done                            chan struct{}
+	input                           io.WriteCloser
+	triggered                       bool
+	questionPending                 bool
+	paused                          bool
+	decoderReady                    bool
+	frames                          chan []byte
+	droppedFrames                   int
+	acceptWakeAfter                 time.Time
 }
 
-func startButton(ctx context.Context, participant *lksdk.LocalParticipant, capture *captureController) (<-chan error, error) {
-	if output, err := exec.Command("iomux", "1", "10", "0").CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("configure GPIO42 pinmux: %w (%s)", err, strings.TrimSpace(string(output)))
+func newWakewordController(ctx context.Context, participant *lksdk.LocalParticipant, capture *captureController, c config, playBeep func()) *wakewordController {
+	return &wakewordController{
+		ctx: ctx, participant: participant, capture: capture,
+		playBeep: playBeep,
+		word:     c.WakeWord, binary: c.WakeBinary, model: c.WakeModel, dictionary: c.WakeDictionary,
+		errCh: make(chan error, 1),
 	}
-	if output, err := exec.Command("io", "-4", buttonPullReg, buttonPullUp).CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("enable GPIO42 pull-up: %w (%s)", err, strings.TrimSpace(string(output)))
-	}
-	if _, err := os.Stat(buttonValue); err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("inspect GPIO42: %w", err)
-		}
-		if err = os.WriteFile("/sys/class/gpio/export", []byte("42"), 0o644); err != nil {
-			return nil, fmt.Errorf("export GPIO42: %w", err)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	if err := os.WriteFile("/sys/class/gpio/gpio42/direction", []byte("in"), 0o644); err != nil {
-		return nil, fmt.Errorf("configure GPIO42 input: %w", err)
-	}
+}
 
-	pressed, err := readButtonPressed()
+func setWorkLED(on bool) {
+	_ = os.WriteFile(workLEDTrigger, []byte("none"), 0o644)
+	value := "0"
+	if on {
+		value = "255"
+	}
+	if err := os.WriteFile(workLEDBrightness, []byte(value), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "work LED error: %v\n", err)
+	}
+}
+
+func playWakeBeep(writer *aplayWriter) error {
+	if writer == nil {
+		return errors.New("no active speaker")
+	}
+	frames := int(sampleRate * wakeBeepDuration / time.Second)
+	buf := make(media.PCM16Sample, frames*outputChannels)
+	for i := 0; i < frames; i++ {
+		value := int16(math.Sin(2*math.Pi*880*float64(i)/sampleRate) * 9000)
+		for channel := 0; channel < outputChannels; channel++ {
+			buf[i*outputChannels+channel] = value
+		}
+	}
+	if err := writer.writeSample(buf, true); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (w *wakewordController) Start() error {
+	w.startMu.Lock()
+	defer w.startMu.Unlock()
+	w.mu.Lock()
+	if w.cancel != nil {
+		wasPaused := w.paused
+		w.triggered, w.paused = false, false
+		if wasPaused {
+			// Complete the previous detector speech segment without feeding it
+			// beep/question audio. This also clears retained VAD hangover.
+			select {
+			case w.frames <- make([]byte, wakeSampleRate): // 500 ms mono silence.
+			default:
+			}
+			w.acceptWakeAfter = time.Now().Add(200 * time.Millisecond)
+		}
+		if w.decoderReady {
+			w.capture.SetWakeSink(w.feed)
+		}
+		w.mu.Unlock()
+		return nil
+	}
+	if _, err := os.Stat(w.binary); err != nil {
+		w.mu.Unlock()
+		return fmt.Errorf("local wake-word runtime %s: %w", w.binary, err)
+	}
+	for _, path := range []string{w.model, w.dictionary} {
+		if _, err := os.Stat(path); err != nil {
+			w.mu.Unlock()
+			return fmt.Errorf("local wake-word resource %s: %w", path, err)
+		}
+	}
+	ctx, cancel := context.WithCancel(w.ctx)
+	done := make(chan struct{})
+	ready := make(chan struct{})
+	frames := make(chan []byte, 16) // At most 320 ms; never block MIC1 on decoding.
+	w.mu.Unlock()
+	threshold := env("WAKEWORD_THRESHOLD", wakeThreshold)
+
+	detector := exec.CommandContext(ctx, w.binary,
+		"-hmm", w.model,
+		"-dict", w.dictionary,
+		"-samprate", fmt.Sprint(wakeSampleRate),
+		"-keyphrase", w.word,
+		"-kws_threshold", threshold,
+		"live", "-",
+	)
+	// Preserve startup errors in the client log. Normal recognizer output is
+	// JSON on stdout, while stderr is useful only for diagnosis.
+	detector.Stderr = os.Stderr
+	input, err := detector.StdinPipe()
 	if err != nil {
-		return nil, fmt.Errorf("read GPIO42: %w", err)
+		cancel()
+		return err
 	}
-	level := "LOW"
-	if pressed {
-		level = "HIGH"
+	output, err := detector.StdoutPipe()
+	if err != nil {
+		cancel()
+		return err
 	}
-	fmt.Printf("Push button ready on GPIO42; released=LOW, pressed=HIGH. Current level=%s\n", level)
-
-	errCh := make(chan error, 1)
+	if err = detector.Start(); err != nil {
+		cancel()
+		return fmt.Errorf("start wake-word detector: %w", err)
+	}
+	w.mu.Lock()
+	w.cancel, w.done, w.input, w.triggered = cancel, done, input, false
+	w.paused, w.decoderReady = false, false
+	w.frames, w.droppedFrames = frames, 0
+	w.mu.Unlock()
 	go func() {
-		defer close(errCh)
-		ticker := time.NewTicker(buttonPoll)
-		defer ticker.Stop()
-		stable, candidate := pressed, pressed
-		changedAt := time.Now()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				current, readErr := readButtonPressed()
-				if readErr != nil {
-					errCh <- fmt.Errorf("read GPIO42: %w", readErr)
+			case pcm := <-frames:
+				w.mu.Lock()
+				paused := w.paused
+				w.mu.Unlock()
+				if paused {
+					continue
+				}
+				if _, err := input.Write(pcm); err != nil {
+					if ctx.Err() == nil {
+						fmt.Fprintf(os.Stderr, "wake decoder input failed: %v\n", err)
+						cancel()
+					}
 					return
 				}
-				if current != candidate {
-					candidate = current
-					changedAt = time.Now()
-				}
-				if candidate == stable || time.Since(changedAt) < buttonDebounce {
-					continue
-				}
-				stable = candidate
-				if !stable {
-					continue
-				}
-				if captureErr := capture.Start(); captureErr != nil {
-					fmt.Fprintf(os.Stderr, "start MIC1 error: %v\n", captureErr)
-					continue
-				}
-				if publishErr := participant.PublishDataPacket(
-					lksdk.UserData([]byte(`{"type":"arm_question"}`)),
-					lksdk.WithDataPublishTopic(buttonTopic),
-					lksdk.WithDataPublishReliable(true),
-				); publishErr != nil {
-					fmt.Fprintf(os.Stderr, "push button event error: %v\n", publishErr)
-					capture.Stop()
-					continue
-				}
-				fmt.Println("Push button pressed; event sent reliably; ask one question.")
 			}
 		}
 	}()
-	return errCh, nil
+
+	go func() {
+		defer close(done)
+		defer func() {
+			w.mu.Lock()
+			if w.done == done {
+				w.cancel, w.done, w.input = nil, nil, nil
+				w.capture.SetWakeSink(nil)
+			}
+			w.mu.Unlock()
+		}()
+		scanner := bufio.NewScanner(output)
+		for scanner.Scan() {
+			var result struct {
+				Transcript string `json:"t"`
+				Ready      bool   `json:"ready"`
+			}
+			if json.Unmarshal(scanner.Bytes(), &result) != nil {
+				fmt.Fprintf(os.Stderr, "wake-word detector output: %s\n", scanner.Text())
+				continue
+			}
+			if result.Ready {
+				w.mu.Lock()
+				if !w.decoderReady {
+					w.decoderReady = true
+					if !w.paused {
+						w.capture.SetWakeSink(w.feed)
+					}
+					close(ready)
+				}
+				w.mu.Unlock()
+				fmt.Printf("WAKE READY: native keyword detector loaded; listening for %q\n", w.word)
+				continue
+			}
+			transcript := strings.TrimSpace(result.Transcript)
+			if transcript != "" {
+				fmt.Printf("WAKE WORD HEARD: %q\n", transcript)
+			}
+			if strings.EqualFold(transcript, w.word) {
+				go w.activate()
+			}
+		}
+		if ctx.Err() == nil {
+			cancel()
+		}
+		detectorErr := detector.Wait()
+		if ctx.Err() == nil && detectorErr != nil {
+			select {
+			case w.errCh <- fmt.Errorf("wake-word detector stopped: %w", detectorErr):
+			default:
+			}
+		}
+	}()
+	select {
+	case <-ready:
+	case <-done:
+		return errors.New("wake detector exited before readiness")
+	case <-time.After(10 * time.Second):
+		cancel()
+		return errors.New("wake detector did not initialize within 10 seconds")
+	}
+	fmt.Printf("MIC1 STANDBY: listening locally for %q (PocketSphinx threshold %s)\n", w.word, threshold)
+	return nil
+}
+
+func (w *wakewordController) Stop() {
+	w.startMu.Lock()
+	defer w.startMu.Unlock()
+	w.mu.Lock()
+	cancel, done := w.cancel, w.done
+	w.mu.Unlock()
+	if cancel == nil {
+		return
+	}
+	w.capture.SetWakeSink(nil)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+	}
+}
+
+func (w *wakewordController) feed(pcm []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.paused || w.frames == nil {
+		return nil
+	}
+	select {
+	case w.frames <- pcm:
+		return nil
+	default:
+	}
+	// Keep current audio instead of accumulating seconds of decoder backlog.
+	select {
+	case <-w.frames:
+	default:
+	}
+	select {
+	case w.frames <- pcm:
+	default:
+	}
+	w.droppedFrames++
+	if w.droppedFrames == 1 || w.droppedFrames%50 == 0 {
+		fmt.Printf("WAKE AUDIO: decoder backlog; dropped old frames=%d\n", w.droppedFrames)
+	}
+	return nil
+}
+
+func (w *wakewordController) SetQuestionPending(pending bool) {
+	w.mu.Lock()
+	w.questionPending = pending
+	w.mu.Unlock()
+}
+
+func (w *wakewordController) QuestionPending() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.questionPending
+}
+
+func (w *wakewordController) Pause() {
+	w.mu.Lock()
+	w.paused = true
+	w.capture.SetWakeSink(nil)
+	if w.frames != nil {
+		for {
+			select {
+			case <-w.frames:
+			default:
+				w.mu.Unlock()
+				return
+			}
+		}
+	}
+	w.mu.Unlock()
+}
+
+func (w *wakewordController) activate() {
+	w.mu.Lock()
+	if w.triggered || w.paused || w.questionPending || time.Now().Before(w.acceptWakeAfter) {
+		w.mu.Unlock()
+		return
+	}
+	w.triggered = true
+	w.questionPending = true
+	w.mu.Unlock()
+	w.Pause()
+	w.capture.SetCloudEnabled(false)
+	if w.interruptPlayback != nil {
+		w.interruptPlayback()
+	}
+	if err := w.participant.PublishDataPacket(
+		lksdk.UserData([]byte(`{"type":"interrupt_answer","source":"wake_word"}`)),
+		lksdk.WithDataPublishTopic(controlTopic),
+		lksdk.WithDataPublishReliable(true),
+	); err != nil {
+		fmt.Fprintf(os.Stderr, "wake interrupt control error: %v\n", err)
+	}
+	setWorkLED(true)
+	if w.playBeep != nil {
+		w.playBeep()
+		// Wait for buffered beep audio before opening question capture.
+		time.Sleep(wakeBeepDuration + wakeBeepSettle)
+	}
+	// The LED acknowledges the wake/beep only; it must not depend on a
+	// later cloud response to turn off.
+	setWorkLED(false)
+	fmt.Println("WAKE ACK: LED off; beep wait complete")
+	if err := w.capture.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "start MIC1 question capture: %v\n", err)
+		setWorkLED(false)
+		w.SetQuestionPending(false)
+		_ = w.Start()
+		return
+	}
+	if err := w.capture.WaitReady(3 * time.Second); err != nil {
+		fmt.Fprintf(os.Stderr, "MIC1 question capture not ready: %v\n", err)
+		w.SetQuestionPending(false)
+		_ = w.Start()
+		return
+	}
+	w.capture.SetCloudEnabled(true)
+	activationPayload, _ := json.Marshal(map[string]string{
+		"type": activationEvent, "source": "wake_word", "wake_word": w.word,
+	})
+	if err := w.participant.PublishDataPacket(
+		lksdk.UserData(activationPayload),
+		lksdk.WithDataPublishTopic(controlTopic),
+		lksdk.WithDataPublishReliable(true),
+	); err != nil {
+		fmt.Fprintf(os.Stderr, "wake-word control event error: %v\n", err)
+		w.capture.SetCloudEnabled(false)
+		setWorkLED(false)
+		w.SetQuestionPending(false)
+		_ = w.Start()
+		return
+	}
+	fmt.Println("WAKE WORD: beep complete; MIC1 is capturing one question for the cloud timer.")
 }
 
 func run() error {
@@ -556,6 +997,37 @@ func run() error {
 	var disconnectOnce sync.Once
 	var playbackMu sync.Mutex
 	playbacks := make(map[string]*lkmedia.PCMRemoteTrack)
+	speakers := make(map[string]*aplayWriter)
+	var activeSpeaker *aplayWriter
+	interruptPlayback := func() {
+		playbackMu.Lock()
+		for _, writer := range speakers {
+			writer.Interrupt()
+		}
+		playbackMu.Unlock()
+		fmt.Println("WAKE INTERRUPT: old AI playback stopped and buffered audio discarded")
+	}
+	playWakeTone := func() {
+		playbackMu.Lock()
+		writer := activeSpeaker
+		playbackMu.Unlock()
+		if err := playWakeBeep(writer); err == nil {
+			return
+		}
+		// The remote AI speaker is sometimes not initialized yet when a local
+		// wake word arrives. Open a short, independent ALSA stream so the user
+		// always gets the audible wake acknowledgement.
+		fallback, err := newAplayWriter(c.PlaybackDevice)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "wake beep speaker error: %v\n", err)
+			return
+		}
+		if err := playWakeBeep(fallback); err != nil {
+			fmt.Fprintf(os.Stderr, "wake beep error: %v\n", err)
+		}
+		time.Sleep(wakeBeepDuration)
+		_ = fallback.Close()
+	}
 
 	callbacks := &lksdk.RoomCallback{
 		OnDisconnected: func() { disconnectOnce.Do(func() { close(disconnected) }) },
@@ -578,12 +1050,19 @@ func run() error {
 				}
 				playbackMu.Lock()
 				playbacks[track.ID()] = pcmTrack
+				speakers[track.ID()] = writer
+				activeSpeaker = writer
 				playbackMu.Unlock()
 			},
 			OnTrackUnsubscribed: func(track *webrtc.TrackRemote, _ *lksdk.RemoteTrackPublication, _ *lksdk.RemoteParticipant) {
 				playbackMu.Lock()
 				pcmTrack := playbacks[track.ID()]
+				writer := speakers[track.ID()]
 				delete(playbacks, track.ID())
+				delete(speakers, track.ID())
+				if activeSpeaker == writer {
+					activeSpeaker = nil
+				}
 				playbackMu.Unlock()
 				if pcmTrack != nil {
 					pcmTrack.Close()
@@ -594,14 +1073,16 @@ func run() error {
 
 	var room *lksdk.Room
 	var capture *captureController
+	var wake *wakewordController
 	var automation *automationBridge
 	callbacks.ParticipantCallback.OnDataPacket = func(data lksdk.DataPacket, params lksdk.DataReceiveParams) {
 		packet, ok := data.(*lksdk.UserDataPacket)
-		if !ok || packet.Topic != buttonTopic {
+		if !ok || packet.Topic != controlTopic {
 			return
 		}
 		var control struct {
-			Type string `json:"type"`
+			Type   string `json:"type"`
+			Reason string `json:"reason"`
 		}
 		if json.Unmarshal(packet.Payload, &control) != nil {
 			return
@@ -611,7 +1092,49 @@ func run() error {
 			return
 		}
 		if control.Type == micSleepEvent && capture != nil {
-			capture.Stop()
+			capture.SetCloudEnabled(false)
+			setWorkLED(false)
+			if wake != nil {
+				wake.SetQuestionPending(false)
+				go func() {
+					if wakeErr := wake.Start(); wakeErr != nil {
+						fmt.Fprintf(os.Stderr, "restart local wake-word listener: %v\n", wakeErr)
+					}
+				}()
+			}
+		} else if control.Type == assistantSpeaking && capture != nil {
+			if wake != nil && wake.QuestionPending() {
+				return // An old answer must not overwrite the newly armed question.
+			}
+			capture.SetCloudEnabled(false)
+			setWorkLED(false)
+			playbackMu.Lock()
+			for _, writer := range speakers {
+				writer.Resume()
+			}
+			playbackMu.Unlock()
+			if wake != nil {
+				go func() {
+					if err := wake.Start(); err != nil {
+						fmt.Fprintf(os.Stderr, "start playback wake listener: %v\n", err)
+					}
+				}()
+			}
+			fmt.Printf("PLAYBACK: local %q listener remains active for interruption\n", c.WakeWord)
+		} else if control.Type == assistantListening && capture != nil {
+			if wake != nil && wake.QuestionPending() {
+				return // Interrupting the old answer must not close the new question.
+			}
+			capture.SetCloudEnabled(false)
+			setWorkLED(false)
+			if wake != nil {
+				go func() {
+					if wakeErr := wake.Start(); wakeErr != nil {
+						fmt.Fprintf(os.Stderr, "restart local wake-word listener: %v\n", wakeErr)
+					}
+				}()
+			}
+			fmt.Printf("STANDBY: AI reply ended; %q detector enabled\n", c.WakeWord)
 		} else if control.Type == geckoRequestEvent && automation != nil {
 			go automation.handle(packet.Payload, params.SenderIdentity)
 		}
@@ -645,7 +1168,7 @@ func run() error {
 		return err
 	}
 
-	micTrack, err := lkmedia.NewPCMLocalTrack(sampleRate, 1, logger.GetLogger())
+	micTrack, err := lkmedia.NewPCMLocalTrack(wakeSampleRate, 1, logger.GetLogger())
 	if err != nil {
 		return fmt.Errorf("create microphone track: %w", err)
 	}
@@ -654,17 +1177,25 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("publish microphone track: %w", err)
 	}
-	fmt.Println("Microphone track published; MIC1 capture starts only after a button press.")
+	fmt.Printf("Microphone track published; cloud capture starts only after local %q detection.\n", c.WakeWord)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	capture = newCaptureController(ctx, micTrack, c.CaptureDevice)
 	defer capture.Stop()
-	buttonErrors, err := startButton(ctx, room.LocalParticipant, capture)
-	if err != nil {
-		return fmt.Errorf("start push button: %w", err)
+	if err = capture.Start(); err != nil {
+		return fmt.Errorf("start local MIC1 capture: %w", err)
 	}
-	fmt.Println("MIC1 OFF: standby; press the button to start capture.")
+	if err = capture.WaitReady(3 * time.Second); err != nil {
+		return err
+	}
+	wake = newWakewordController(ctx, room.LocalParticipant, capture, c, playWakeTone)
+	wake.interruptPlayback = interruptPlayback
+	defer wake.Stop()
+	if err = wake.Start(); err != nil {
+		return fmt.Errorf("start local %q detector: %w", c.WakeWord, err)
+	}
+	fmt.Printf("MIC1 standby is local only. Say %q, wait for the beep, then ask one question.\n", c.WakeWord)
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	select {
@@ -676,9 +1207,9 @@ func run() error {
 		if captureErr != nil {
 			return captureErr
 		}
-	case buttonErr := <-buttonErrors:
-		if buttonErr != nil {
-			return buttonErr
+	case wakeErr := <-wake.errCh:
+		if wakeErr != nil {
+			return wakeErr
 		}
 	}
 	return nil

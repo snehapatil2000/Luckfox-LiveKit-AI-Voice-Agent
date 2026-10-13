@@ -36,13 +36,16 @@ load_dotenv(".env.local")
 
 logger = logging.getLogger("voice-transcript")
 
-BUTTON_TOPIC = "luckfox-control"
-BUTTON_EVENT_TYPE = "arm_question"
+CONTROL_TOPIC = "luckfox-control"
+ACTIVATION_EVENT_TYPE = "arm_question"
+INTERRUPTION_EVENT_TYPE = "interrupt_answer"
 MIC_SLEEP_EVENT_TYPE = "mic_sleep"
+ASSISTANT_SPEAKING_EVENT_TYPE = "assistant_speaking"
+ASSISTANT_LISTENING_EVENT_TYPE = "assistant_listening"
 GECKOLINK_REQUEST_EVENT_TYPE = "geckolink_request"
 GECKOLINK_RESPONSE_EVENT_TYPE = "geckolink_response"
 GECKOLINK_REQUEST_TIMEOUT = 12.0
-BUTTON_SPEECH_TIMEOUT = 3.0
+QUESTION_START_TIMEOUT = 1.5
 
 
 KANNADA_SCRIPT = re.compile(r"[\u0C80-\u0CFF]")
@@ -189,7 +192,7 @@ class RoomGeckoLinkTransport:
         }
         try:
             await self._room.local_participant.publish_data(
-                json.dumps(packet), reliable=True, topic=BUTTON_TOPIC
+                json.dumps(packet), reliable=True, topic=CONTROL_TOPIC
             )
             response = await asyncio.wait_for(future, timeout=GECKOLINK_REQUEST_TIMEOUT)
         except TimeoutError as error:
@@ -227,15 +230,15 @@ class Assistant(Agent):
         self,
         english_tts,
         kannada_tts=None,
-        on_sleep: Callable[[], None] | None = None,
+        on_sleep: Callable[[str], None] | None = None,
         geckolink: GeckoLinkClient | None = None,
     ):
         self._english_tts = english_tts
         self._kannada_tts = kannada_tts
         self._on_sleep = on_sleep
         self._geckolink = geckolink
-        self._button_armed = False
-        self._button_speech_started = False
+        self._activation_armed = False
+        self._activation_speech_started = False
         super().__init__(
             instructions=textwrap.dedent(
                 """
@@ -279,36 +282,41 @@ class Assistant(Agent):
             )
         )
 
-    def arm_from_button(self) -> None:
-        """Allow exactly one question after a hardware-button press."""
-        self._button_armed = True
-        self._button_speech_started = False
-        logger.info("PUSH BUTTON: armed; speak within 3000 ms")
+    def arm_from_wake_word(self) -> None:
+        """Allow exactly one question after local Edison detection."""
+        self._activation_armed = True
+        self._activation_speech_started = False
+        logger.info("WAKE WORD: Edison accepted; speak within 1500 ms")
 
-    def mark_button_speech_started(self) -> bool:
-        """Record speech start for the currently armed question."""
-        if not self._button_armed or self._button_speech_started:
+    def mark_activation_speech_started(self) -> bool:
+        """Record speech start for the current wake-word activation."""
+        if not self._activation_armed or self._activation_speech_started:
             return False
-        self._button_speech_started = True
+        self._activation_speech_started = True
         return True
 
-    def expire_button_arm(self) -> bool:
-        """Return to standby if no speech started after the button press."""
-        if not self._button_armed or self._button_speech_started:
+    def cancel_activation(self) -> None:
+        """Discard an old question without cancelling a new local wake."""
+        self._activation_armed = False
+        self._activation_speech_started = False
+
+    def expire_activation(self) -> bool:
+        """Return to standby if no speech begins after Edison."""
+        if not self._activation_armed or self._activation_speech_started:
             return False
-        self._button_armed = False
+        self._activation_armed = False
         if self._on_sleep is not None:
-            self._on_sleep()
+            self._on_sleep("no_speech")
         return True
 
-    def consume_button_arm(self) -> bool:
-        """Consume and return the current one-question hardware arm."""
-        if not self._button_armed or not self._button_speech_started:
+    def consume_activation(self) -> bool:
+        """Consume and return the current one-question wake-word activation."""
+        if not self._activation_armed or not self._activation_speech_started:
             return False
-        self._button_armed = False
-        self._button_speech_started = False
+        self._activation_armed = False
+        self._activation_speech_started = False
         if self._on_sleep is not None:
-            self._on_sleep()
+            self._on_sleep("question_complete")
         return True
 
     @function_tool
@@ -630,8 +638,8 @@ class Assistant(Agent):
 
     async def on_user_turn_completed(self, turn_ctx, new_message):
         user_text = (new_message.raw_text_content or "").strip()
-        if not self.consume_button_arm():
-            logger.info("STANDBY: ignored speech; press the button for one question")
+        if not self.consume_activation():
+            logger.info("STANDBY: ignored speech; say Edison first")
             raise StopResponse()
 
         if not user_text:
@@ -652,7 +660,7 @@ class Assistant(Agent):
                 )
             )
         logger.info(
-            "PUSH BUTTON: accepted one question language=%s: %s",
+            "WAKE WORD: accepted one question language=%s: %s",
             language_name,
             user_text,
         )
@@ -713,18 +721,18 @@ async def my_agent(ctx: agents.JobContext):
             # committing the question. This lets users pause naturally.
             endpointing={
                 "mode": "fixed",
-                "min_delay": BUTTON_SPEECH_TIMEOUT,
-                "max_delay": BUTTON_SPEECH_TIMEOUT,
+                "min_delay": QUESTION_START_TIMEOUT,
+                "max_delay": QUESTION_START_TIMEOUT,
             },
             # Luckfox speaker audio is captured by its nearby microphone.
-            # Do not use acoustic interruption: the button is the only
-            # activation control, which prevents speaker echo/noise from
+            # Do not use acoustic interruption: local "Edison" is the
+            # only activation control, which prevents speaker echo/noise from
             # cutting an answer short.
             interruption={
                 "mode": "adaptive",
                 "enabled": False,
-                # Keep the session stable while TTS plays; a later button
-                # press arms the next question.
+                # Keep the session stable while TTS plays; a later wake word
+                # interrupts the old answer and arms the next question.
                 "discard_audio_if_uninterruptible": False,
                 "min_duration": 0.45,
                 "min_words": 4,
@@ -738,25 +746,25 @@ async def my_agent(ctx: agents.JobContext):
     geckolink_transport = RoomGeckoLinkTransport(ctx.room)
     geckolink_client = GeckoLinkClient(geckolink_transport.request)
 
-    async def notify_mic_sleep() -> None:
+    async def notify_mic_sleep(reason: str) -> None:
         try:
             await ctx.room.local_participant.publish_data(
-                json.dumps({"type": MIC_SLEEP_EVENT_TYPE}),
+                json.dumps({"type": MIC_SLEEP_EVENT_TYPE, "reason": reason}),
                 reliable=True,
-                topic=BUTTON_TOPIC,
+                topic=CONTROL_TOPIC,
             )
         except Exception:
             logger.exception("STANDBY: failed to send MIC1 sleep event")
 
-    def enter_sleep() -> None:
+    def enter_sleep(reason: str) -> None:
         session.input.set_audio_enabled(False)
-        task = loop.create_task(notify_mic_sleep())
+        task = loop.create_task(notify_mic_sleep(reason))
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
-        logger.info("STANDBY: audio input disabled; MIC1 sleep requested")
+        logger.info("STANDBY: audio input disabled; MIC1 sleep requested reason=%s", reason)
 
     session.input.set_audio_enabled(False)
-    logger.info("STANDBY: audio input disabled until the push button is pressed")
+    logger.info("STANDBY: cloud audio input disabled until local Edison detection")
     assistant = Assistant(
         english_tts,
         kannada_tts,
@@ -774,18 +782,18 @@ async def my_agent(ctx: agents.JobContext):
     def expire_silent_arm() -> None:
         nonlocal arm_timeout
         arm_timeout = None
-        if assistant.expire_button_arm():
-            logger.info("PUSH BUTTON: no speech within 3000 ms; standby")
+        if assistant.expire_activation():
+            logger.info("WAKE WORD: no speech within 1500 ms; standby")
 
     def record_speech_start() -> None:
-        if assistant.mark_button_speech_started():
+        if assistant.mark_activation_speech_started():
             cancel_arm_timeout()
-            logger.info("PUSH BUTTON: speech started; capturing until 3000 ms silence")
+            logger.info("WAKE WORD: speech started; capturing until 1500 ms silence")
 
     @ctx.room.on("data_received")
     def on_data_received(packet):
         nonlocal arm_timeout
-        if packet.topic != BUTTON_TOPIC:
+        if packet.topic != CONTROL_TOPIC:
             return
         try:
             payload = json.loads(packet.data.decode("utf-8"))
@@ -794,15 +802,22 @@ async def my_agent(ctx: agents.JobContext):
             return
         if geckolink_transport.handle_response(payload):
             return
-        if payload.get("type") == BUTTON_EVENT_TYPE:
+        if payload.get("type") == INTERRUPTION_EVENT_TYPE:
+            cancel_arm_timeout()
+            assistant.cancel_activation()
+            session.input.set_audio_enabled(False)
+            session.interrupt(force=True)
+            logger.info("WAKE WORD: force-stopped old answer; waiting for beep completion")
+            return
+        if payload.get("type") == ACTIVATION_EVENT_TYPE:
             speech = session.current_speech
             if speech is not None and not speech.interrupted:
-                logger.info("PUSH BUTTON: interrupting current answer")
+                logger.info("WAKE WORD: interrupting current answer")
                 session.interrupt(force=True)
-            assistant.arm_from_button()
+            assistant.arm_from_wake_word()
             session.input.set_audio_enabled(True)
             cancel_arm_timeout()
-            arm_timeout = loop.call_later(BUTTON_SPEECH_TIMEOUT, expire_silent_arm)
+            arm_timeout = loop.call_later(QUESTION_START_TIMEOUT, expire_silent_arm)
 
     @session.on("user_state_changed")
     def on_user_state_changed(event):
@@ -827,6 +842,26 @@ async def my_agent(ctx: agents.JobContext):
     @session.on("agent_state_changed")
     def on_agent_state_changed(event):
         logger.info("VOICE STATE: %s", event.new_state)
+        event_type = {
+            "speaking": ASSISTANT_SPEAKING_EVENT_TYPE,
+            "listening": ASSISTANT_LISTENING_EVENT_TYPE,
+        }.get(event.new_state)
+        if event_type is None:
+            return
+
+        async def notify_board_state() -> None:
+            try:
+                await ctx.room.local_participant.publish_data(
+                    json.dumps({"type": event_type}),
+                    reliable=True,
+                    topic=CONTROL_TOPIC,
+                )
+            except Exception:
+                logger.exception("VOICE STATE: failed to notify Luckfox state=%s", event.new_state)
+
+        task = loop.create_task(notify_board_state())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
 
     await session.start(
         agent=assistant,
@@ -835,7 +870,7 @@ async def my_agent(ctx: agents.JobContext):
     )
 
     await ctx.connect()
-    await notify_mic_sleep()
+    await notify_mic_sleep("startup")
 
 
 if __name__ == "__main__":
