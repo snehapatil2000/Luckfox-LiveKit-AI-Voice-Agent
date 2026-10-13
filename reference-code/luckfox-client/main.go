@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -31,8 +32,9 @@ import (
 const (
 	sampleRate = 48000
 	// Use the same native mono capture format as the working wake listener.
-	inputChannels      = 1
-	outputChannels     = 2
+	inputChannels = 1
+	// Agent speech is mono; stereo decoding wastes work needed by the wake engine.
+	outputChannels     = 1
 	frameMillis        = 20
 	controlTopic       = "luckfox-control"
 	activationEvent    = "arm_question"
@@ -43,29 +45,26 @@ const (
 	geckoRequestEvent  = "geckolink_request"
 	geckoResponseEvent = "geckolink_response"
 	wakeSampleRate     = 16000
-	wakeWord           = "edison"
-	wakeBinary         = "/opt/luckfox-wakeword/luckfox-wakeword"
-	wakeModel          = "/opt/luckfox-wakeword/en-us/en-us"
-	wakeDictionary     = "/opt/luckfox-wakeword/en-us/cmudict-en-us.dict"
-	// Calibrated for one Edison followed by silence on MIC1. A threshold tuned
-	// for a longer phrase was too permissive for this single-word wake command.
-	wakeThreshold     = "1e-5"
-	workLEDTrigger    = "/sys/class/leds/work/trigger"
-	workLEDBrightness = "/sys/class/leds/work/brightness"
-	wakeBeepDuration  = 400 * time.Millisecond
+	wakeWord           = "alexa"
+	wakeBinary         = "/opt/luckfox-microwakeword/run-microwakeword.sh"
+	wakeModel          = "/opt/luckfox-microwakeword/alexa.tflite"
+	wakeManifest       = "/opt/luckfox-microwakeword/alexa.json"
+	workLEDTrigger     = "/sys/class/leds/work/trigger"
+	workLEDBrightness  = "/sys/class/leds/work/brightness"
+	wakeBeepDuration   = 400 * time.Millisecond
 	// aplay buffers audio, so wait for the audible confirmation to finish
 	// before starting cloud capture and its 1.5-second question timer.
 	wakeBeepSettle = 600 * time.Millisecond
 )
 
 type config struct {
-	URL, APIKey, APISecret, Token         string
-	Room, Identity, AgentName             string
-	CaptureDevice, PlaybackDevice         string
-	WakeCaptureDevice, WakeWord           string
-	WakeBinary, WakeModel, WakeDictionary string
-	GeckoLinkToken                        string
-	GeckoLinkUsername, GeckoLinkPassword  string
+	URL, APIKey, APISecret, Token        string
+	Room, Identity, AgentName            string
+	CaptureDevice, PlaybackDevice        string
+	WakeCaptureDevice, WakeWord          string
+	WakeBinary, WakeModel, WakeManifest  string
+	GeckoLinkToken                       string
+	GeckoLinkUsername, GeckoLinkPassword string
 }
 
 func env(name, fallback string) string {
@@ -88,12 +87,12 @@ func loadConfig() (config, error) {
 		// simultaneous MIC1 capture and speaker playback more reliably than
 		// the raw hw device.
 		CaptureDevice:     env("CAPTURE_DEVICE", "plughw:0,0"),
-		PlaybackDevice:    env("PLAYBACK_DEVICE", "hw:0,0"),
+		PlaybackDevice:    env("PLAYBACK_DEVICE", "plughw:0,0"),
 		WakeCaptureDevice: env("WAKE_CAPTURE_DEVICE", "plughw:0,0"),
 		WakeWord:          strings.ToLower(env("WAKE_WORD", wakeWord)),
 		WakeBinary:        env("WAKEWORD_BINARY", wakeBinary),
 		WakeModel:         env("WAKEWORD_MODEL", wakeModel),
-		WakeDictionary:    env("WAKEWORD_DICTIONARY", wakeDictionary),
+		WakeManifest:      env("WAKEWORD_CONFIG", wakeManifest),
 		GeckoLinkToken:    os.Getenv("GECKOLINK_TOKEN"),
 		GeckoLinkUsername: os.Getenv("GECKOLINK_USERNAME"),
 		GeckoLinkPassword: os.Getenv("GECKOLINK_PASSWORD"),
@@ -634,32 +633,32 @@ func (c *captureController) Stop() {
 }
 
 type wakewordController struct {
-	ctx                             context.Context
-	participant                     *lksdk.LocalParticipant
-	capture                         *captureController
-	playBeep                        func()
-	interruptPlayback               func()
-	word, binary, model, dictionary string
-	errCh                           chan error
-	startMu                         sync.Mutex
-	mu                              sync.Mutex
-	cancel                          context.CancelFunc
-	done                            chan struct{}
-	input                           io.WriteCloser
-	triggered                       bool
-	questionPending                 bool
-	paused                          bool
-	decoderReady                    bool
-	frames                          chan []byte
-	droppedFrames                   int
-	acceptWakeAfter                 time.Time
+	ctx                           context.Context
+	participant                   *lksdk.LocalParticipant
+	capture                       *captureController
+	playBeep                      func()
+	interruptPlayback             func()
+	word, binary, model, manifest string
+	errCh                         chan error
+	startMu                       sync.Mutex
+	mu                            sync.Mutex
+	cancel                        context.CancelFunc
+	done                          chan struct{}
+	input                         io.WriteCloser
+	triggered                     bool
+	questionPending               bool
+	paused                        bool
+	decoderReady                  bool
+	frames                        chan []byte
+	droppedFrames                 int
+	acceptWakeAfter               time.Time
 }
 
 func newWakewordController(ctx context.Context, participant *lksdk.LocalParticipant, capture *captureController, c config, playBeep func()) *wakewordController {
 	return &wakewordController{
 		ctx: ctx, participant: participant, capture: capture,
 		playBeep: playBeep,
-		word:     c.WakeWord, binary: c.WakeBinary, model: c.WakeModel, dictionary: c.WakeDictionary,
+		word:     c.WakeWord, binary: c.WakeBinary, model: c.WakeModel, manifest: c.WakeManifest,
 		errCh: make(chan error, 1),
 	}
 }
@@ -693,6 +692,38 @@ func playWakeBeep(writer *aplayWriter) error {
 	return nil
 }
 
+// Read the settings shipped with the model. A label cannot change the word
+// recognized by a neural model, so reject mismatched model configuration.
+func microWakeArguments(model, manifest, word string) ([]string, error) {
+	data, err := os.ReadFile(manifest)
+	if err != nil {
+		return nil, err
+	}
+	var settings struct {
+		Type    string `json:"type"`
+		Word    string `json:"wake_word"`
+		Model   string `json:"model"`
+		Version int    `json:"version"`
+		Micro   struct {
+			Cutoff float64 `json:"probability_cutoff"`
+			Window int     `json:"sliding_window_size"`
+			Step   int     `json:"feature_step_size"`
+		} `json:"micro"`
+	}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return nil, err
+	}
+	if settings.Type != "micro" || settings.Version != 2 || settings.Micro.Step != 10 ||
+		!strings.EqualFold(settings.Word, word) || settings.Model != filepath.Base(model) ||
+		settings.Micro.Cutoff <= 0 || settings.Micro.Cutoff >= 1 || settings.Micro.Window < 1 || settings.Micro.Window > 200 {
+		return nil, errors.New("microWakeWord model and configuration do not match the requested word or supported format")
+	}
+	if _, err := os.Stat(model); err != nil {
+		return nil, err
+	}
+	return []string{model, strings.ToLower(word), fmt.Sprint(settings.Micro.Cutoff), fmt.Sprint(settings.Micro.Window)}, nil
+}
+
 func (w *wakewordController) Start() error {
 	w.startMu.Lock()
 	defer w.startMu.Unlock()
@@ -701,10 +732,10 @@ func (w *wakewordController) Start() error {
 		wasPaused := w.paused
 		w.triggered, w.paused = false, false
 		if wasPaused {
-			// Complete the previous detector speech segment without feeding it
-			// beep/question audio. This also clears retained VAD hangover.
+			// Flush the neural model's audio history without feeding beep/question
+			// audio. The next wake must come from fresh microphone samples.
 			select {
-			case w.frames <- make([]byte, wakeSampleRate): // 500 ms mono silence.
+			case w.frames <- make([]byte, 2*wakeSampleRate*2): // Two seconds of mono silence.
 			default:
 			}
 			w.acceptWakeAfter = time.Now().Add(200 * time.Millisecond)
@@ -719,27 +750,17 @@ func (w *wakewordController) Start() error {
 		w.mu.Unlock()
 		return fmt.Errorf("local wake-word runtime %s: %w", w.binary, err)
 	}
-	for _, path := range []string{w.model, w.dictionary} {
-		if _, err := os.Stat(path); err != nil {
-			w.mu.Unlock()
-			return fmt.Errorf("local wake-word resource %s: %w", path, err)
-		}
+	args, err := microWakeArguments(w.model, w.manifest, w.word)
+	if err != nil {
+		w.mu.Unlock()
+		return fmt.Errorf("local wake-word configuration: %w", err)
 	}
 	ctx, cancel := context.WithCancel(w.ctx)
 	done := make(chan struct{})
 	ready := make(chan struct{})
-	frames := make(chan []byte, 16) // At most 320 ms; never block MIC1 on decoding.
+	frames := make(chan []byte, 32) // At most 640 ms; tolerate short playback CPU bursts.
 	w.mu.Unlock()
-	threshold := env("WAKEWORD_THRESHOLD", wakeThreshold)
-
-	detector := exec.CommandContext(ctx, w.binary,
-		"-hmm", w.model,
-		"-dict", w.dictionary,
-		"-samprate", fmt.Sprint(wakeSampleRate),
-		"-keyphrase", w.word,
-		"-kws_threshold", threshold,
-		"live", "-",
-	)
+	detector := exec.CommandContext(ctx, w.binary, args...)
 	// Preserve startup errors in the client log. Normal recognizer output is
 	// JSON on stdout, while stderr is useful only for diagnosis.
 	detector.Stderr = os.Stderr
@@ -826,11 +847,15 @@ func (w *wakewordController) Start() error {
 				go w.activate()
 			}
 		}
-		if ctx.Err() == nil {
+		unexpectedExit := ctx.Err() == nil
+		if unexpectedExit {
 			cancel()
 		}
 		detectorErr := detector.Wait()
-		if ctx.Err() == nil && detectorErr != nil {
+		if unexpectedExit {
+			if detectorErr == nil {
+				detectorErr = errors.New("unexpected end of detector output")
+			}
 			select {
 			case w.errCh <- fmt.Errorf("wake-word detector stopped: %w", detectorErr):
 			default:
@@ -845,7 +870,7 @@ func (w *wakewordController) Start() error {
 		cancel()
 		return errors.New("wake detector did not initialize within 10 seconds")
 	}
-	fmt.Printf("MIC1 STANDBY: listening locally for %q (PocketSphinx threshold %s)\n", w.word, threshold)
+	fmt.Printf("MIC1 STANDBY: listening locally for %q (microWakeWord cutoff %s)\n", w.word, args[2])
 	return nil
 }
 
@@ -925,6 +950,8 @@ func (w *wakewordController) Pause() {
 func (w *wakewordController) activate() {
 	w.mu.Lock()
 	if w.triggered || w.paused || w.questionPending || time.Now().Before(w.acceptWakeAfter) {
+		fmt.Printf("WAKE IGNORED: triggered=%t paused=%t question_pending=%t settling=%t\n",
+			w.triggered, w.paused, w.questionPending, time.Now().Before(w.acceptWakeAfter))
 		w.mu.Unlock()
 		return
 	}

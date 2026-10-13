@@ -283,10 +283,10 @@ class Assistant(Agent):
         )
 
     def arm_from_wake_word(self) -> None:
-        """Allow exactly one question after local Edison detection."""
+        """Allow exactly one question after local wake-word detection."""
         self._activation_armed = True
         self._activation_speech_started = False
-        logger.info("WAKE WORD: Edison accepted; speak within 1500 ms")
+        logger.info("WAKE WORD: local detection accepted; speak within 1500 ms")
 
     def mark_activation_speech_started(self) -> bool:
         """Record speech start for the current wake-word activation."""
@@ -301,7 +301,7 @@ class Assistant(Agent):
         self._activation_speech_started = False
 
     def expire_activation(self) -> bool:
-        """Return to standby if no speech begins after Edison."""
+        """Return to standby if no speech begins after the wake word."""
         if not self._activation_armed or self._activation_speech_started:
             return False
         self._activation_armed = False
@@ -639,7 +639,7 @@ class Assistant(Agent):
     async def on_user_turn_completed(self, turn_ctx, new_message):
         user_text = (new_message.raw_text_content or "").strip()
         if not self.consume_activation():
-            logger.info("STANDBY: ignored speech; say Edison first")
+            logger.info("STANDBY: ignored speech; say the local wake word first")
             raise StopResponse()
 
         if not user_text:
@@ -717,7 +717,7 @@ async def my_agent(ctx: agents.JobContext):
         tts=english_tts,
         turn_handling=TurnHandlingOptions(
             turn_detection=inference.TurnDetector(unlikely_threshold=0.4),
-            # After speech starts, wait for three seconds of silence before
+            # After speech starts, wait for 1.5 seconds of silence before
             # committing the question. This lets users pause naturally.
             endpointing={
                 "mode": "fixed",
@@ -725,7 +725,7 @@ async def my_agent(ctx: agents.JobContext):
                 "max_delay": QUESTION_START_TIMEOUT,
             },
             # Luckfox speaker audio is captured by its nearby microphone.
-            # Do not use acoustic interruption: local "Edison" is the
+            # Do not use acoustic interruption: the local wake word is the
             # only activation control, which prevents speaker echo/noise from
             # cutting an answer short.
             interruption={
@@ -764,7 +764,7 @@ async def my_agent(ctx: agents.JobContext):
         logger.info("STANDBY: audio input disabled; MIC1 sleep requested reason=%s", reason)
 
     session.input.set_audio_enabled(False)
-    logger.info("STANDBY: cloud audio input disabled until local Edison detection")
+    logger.info("STANDBY: cloud audio input disabled until local wake-word detection")
     assistant = Assistant(
         english_tts,
         kannada_tts,

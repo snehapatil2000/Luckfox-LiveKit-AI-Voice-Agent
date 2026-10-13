@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"math"
 	"net/http"
@@ -18,123 +17,50 @@ import (
 	"github.com/livekit/media-sdk"
 )
 
-func TestWakeVoiceCalibration(t *testing.T) {
-	threshold := os.Getenv("WAKE_CALIBRATION_THRESHOLD")
-	if threshold == "" {
-		t.Skip("set WAKE_CALIBRATION_THRESHOLD for the private MIC1 recording")
-	}
-	phrase := env("WAKE_CALIBRATION_WORD", wakeWord)
-	audio, err := os.ReadFile(env("WAKE_CALIBRATION_AUDIO", "/tmp/wake-voice-calibration.raw"))
-	if err != nil {
+func TestMicroWakeModelConfiguration(t *testing.T) {
+	directory := t.TempDir()
+	model := filepath.Join(directory, "alexa.tflite")
+	manifest := filepath.Join(directory, "alexa.json")
+	if err := os.WriteFile(model, []byte("fixture"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	var filter microphoneDCBlocker
-	for i := 0; i+1 < len(audio); i += 2 {
-		value := int16(binary.LittleEndian.Uint16(audio[i:]))
-		binary.LittleEndian.PutUint16(audio[i:], uint16(filter.Filter(value)))
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	decoder := os.Getenv("WAKE_CALIBRATION_BINARY")
-	if decoder == "" {
-		decoder = "/opt/luckfox-wakeword/luckfox-wakeword"
-	}
-	cmd := exec.CommandContext(ctx, decoder,
-		"-hmm", "/opt/luckfox-wakeword/en-us/en-us", "-dict", "/opt/luckfox-wakeword/en-us/cmudict-en-us.dict",
-		"-samprate", "16000", "-keyphrase", phrase, "-kws_threshold", threshold, "live", "-")
-	cmd.Stdin = bytes.NewReader(audio)
-	cmd.Stderr = os.Stderr
-	output, err := cmd.StdoutPipe()
-	if err != nil {
+	if err := os.WriteFile(manifest, []byte(testAlexaManifest), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := cmd.Start(); err != nil {
+	args, err := microWakeArguments(model, manifest, "Alexa")
+	if err != nil || len(args) != 4 || args[1] != "alexa" || args[2] != "0.9" || args[3] != "5" {
+		t.Fatalf("model settings not respected: args=%v error=%v", args, err)
+	}
+	if _, err := microWakeArguments(model, manifest, "edison"); err == nil {
+		t.Fatal("an Alexa model must not be advertised as Edison")
+	}
+	if err := os.WriteFile(manifest, []byte(`{"type":"micro","wake_word":"Alexa","model":"alexa.tflite","version":2,"micro":{"probability_cutoff":0.9,"sliding_window_size":0,"feature_step_size":20}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	defer cmd.Wait()
-	defer cmd.Process.Kill()
-	scanner := bufio.NewScanner(output)
-	for scanner.Scan() {
-		var result struct {
-			Transcript string `json:"t"`
-		}
-		if json.Unmarshal(scanner.Bytes(), &result) == nil && result.Transcript == phrase {
-			t.Logf("private MIC1 sample matched %q at threshold %s", phrase, threshold)
-			return
-		}
+	if _, err := microWakeArguments(model, manifest, "alexa"); err == nil {
+		t.Fatal("unsupported feature interval/window must be rejected")
 	}
-	t.Fatalf("private MIC1 sample did not match %q at threshold %s", phrase, threshold)
 }
 
-func TestSingleEdisonWakeDoesNotRepeatInQuiet(t *testing.T) {
-	threshold := os.Getenv("EDISON_ONCE_THRESHOLD")
-	if threshold == "" {
-		t.Skip("set EDISON_ONCE_THRESHOLD for the one-utterance MIC1 calibration")
-	}
-	audio, err := os.ReadFile("/tmp/edison-once-calibration.raw")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(audio) < 5*16000*2 {
-		t.Fatal("calibration must include at least five seconds of quiet at the end")
-	}
-	for _, test := range []struct {
-		name    string
-		audio   []byte
-		matches int
-	}{
-		{"one wake then quiet", audio, 1},
-		{"quiet tail only", audio[len(audio)-5*16000*2:], 0},
-		{"second wake after quiet", append(append([]byte(nil), audio...), audio...), 2},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			audio := append([]byte(nil), test.audio...)
-			var filter microphoneDCBlocker
-			for i := 0; i+1 < len(audio); i += 2 {
-				value := int16(binary.LittleEndian.Uint16(audio[i:]))
-				binary.LittleEndian.PutUint16(audio[i:], uint16(filter.Filter(value)))
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, "/tmp/luckfox-wakeword", "-hmm", "/opt/luckfox-wakeword/en-us/en-us",
-				"-dict", "/opt/luckfox-wakeword/en-us/cmudict-en-us.dict", "-samprate", "16000",
-				"-keyphrase", "edison", "-kws_threshold", threshold, "live", "-")
-			cmd.Stdin = bytes.NewReader(audio)
-			output, err := cmd.CombinedOutput()
-			if err != nil {
-				t.Fatalf("decoder calibration failed: %v: %s", err, output)
-			}
-			matches := 0
-			for _, line := range bytes.Split(output, []byte{'\n'}) {
-				var result struct {
-					Transcript string `json:"t"`
-				}
-				if json.Unmarshal(line, &result) == nil && result.Transcript == "edison" {
-					matches++
-				}
-			}
-			if matches != test.matches {
-				t.Fatalf("expected %d wake events; got %d at threshold %s: %s", test.matches, matches, threshold, output)
-			}
-			t.Logf("threshold %s: %s", threshold, output)
-		})
-	}
-}
+const testAlexaManifest = `{"type":"micro","wake_word":"Alexa","model":"alexa.tflite","version":2,"micro":{"probability_cutoff":0.9,"sliding_window_size":5,"feature_step_size":10}}`
 
 func TestStreamingKeywordEmitsBeforeInputCloses(t *testing.T) {
-	binary := os.Getenv("WAKE_TEST_BINARY")
-	if binary == "" {
-		t.Skip("set WAKE_TEST_BINARY for the native PocketSphinx runtime test")
+	runner := os.Getenv("WAKE_TEST_BINARY")
+	if runner == "" {
+		t.Skip("set WAKE_TEST_BINARY and WAKE_TEST_AUDIO for the ARM microWakeWord test")
 	}
-	audio, err := os.ReadFile("/tmp/goforward.raw")
+	audio, err := os.ReadFile(os.Getenv("WAKE_TEST_AUDIO"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, err := microWakeArguments(env("WAKEWORD_MODEL", wakeModel), env("WAKEWORD_CONFIG", wakeManifest), "alexa")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, binary, "-hmm", "/opt/luckfox-wakeword/en-us/en-us",
-		"-dict", "/opt/luckfox-wakeword/en-us/cmudict-en-us.dict", "-samprate", "16000",
-		"-keyphrase", "go forward", "-kws_threshold", "1e-30", "live", "-")
+	cmd := exec.CommandContext(ctx, runner, args...)
+	cmd.Stderr = os.Stderr
 	input, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -151,14 +77,17 @@ func TestStreamingKeywordEmitsBeforeInputCloses(t *testing.T) {
 	defer cmd.Process.Kill()
 	go func() {
 		_, _ = input.Write(audio)
-		// Deliberately keep stdin open: detection must not wait for EOF.
+		// Keep stdin open: a microphone never reaches EOF during standby.
 	}()
 	scanner := bufio.NewScanner(output)
 	if !scanner.Scan() || scanner.Text() != `{"ready":true}` {
-		t.Fatal("native keyword detector did not initialize")
+		t.Fatal("detector did not initialize")
 	}
-	if !scanner.Scan() || scanner.Text() != `{"t":"go forward"}` {
-		t.Fatalf("keyword was not emitted during live input: %q (timeout=%v)", scanner.Text(), ctx.Err())
+	var result struct {
+		Word string `json:"t"`
+	}
+	if !scanner.Scan() || json.Unmarshal(scanner.Bytes(), &result) != nil || result.Word != "alexa" {
+		t.Fatalf("Alexa was not emitted during live input: %q (timeout=%v)", scanner.Text(), ctx.Err())
 	}
 }
 
@@ -167,6 +96,17 @@ type testPCMBuffer struct {
 }
 
 func (b *testPCMBuffer) Close() error { return nil }
+
+func TestWakeBeepUsesMonoPlaybackFormat(t *testing.T) {
+	buffer := &testPCMBuffer{}
+	writer := &aplayWriter{in: buffer, muted: true}
+	if err := playWakeBeep(writer); err != nil {
+		t.Fatal(err)
+	}
+	if outputChannels != 1 || buffer.Len() != 38400 {
+		t.Fatalf("400 ms at 48 kHz mono must produce 38400 bytes, got channels=%d bytes=%d", outputChannels, buffer.Len())
+	}
+}
 
 func TestInterruptedPlaybackDropsOldAudioButAllowsWakeBeep(t *testing.T) {
 	buffer := &testPCMBuffer{}
@@ -217,8 +157,16 @@ func TestWakeListenerCanRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	capture := newCaptureController(context.Background(), nil, "unused")
+	model := filepath.Join(resources, "alexa.tflite")
+	manifest := filepath.Join(resources, "alexa.json")
+	if err := os.WriteFile(model, []byte("fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifest, []byte(testAlexaManifest), 0600); err != nil {
+		t.Fatal(err)
+	}
 	wake := newWakewordController(context.Background(), nil, capture,
-		config{WakeWord: "edison", WakeBinary: binary, WakeModel: resources, WakeDictionary: resources}, nil)
+		config{WakeWord: "alexa", WakeBinary: binary, WakeModel: model, WakeManifest: manifest}, nil)
 	defer wake.Stop()
 	for cycle := 0; cycle < 3; cycle++ {
 		wake.SetQuestionPending(true)

@@ -17,6 +17,7 @@
 
 # Go build cache and generated native build output
 reference-code/luckfox-client/.gocache/
+reference-code/luckfox-client/build/microwakeword/
 reference-code/luckfox-client/opus-armv7/
 reference-code/luckfox-client/third_party/opus-1.5.2/
 

@@ -26,8 +26,10 @@ GeckoLink tool request -> LiveKit data -> Luckfox -> A20 GeckoLink REST API
 
 - English: Sarvam Saaras STT -> DeepSeek -> Sarvam Bulbul `en-IN` TTS
 - Kannada: Sarvam Saaras STT -> DeepSeek -> Sarvam Bulbul `kn-IN` TTS
-- Activation: press the Luckfox push button to arm one question
-- Barge-in: press the button while an answer is playing, then ask the new question
+- Activation: say “Alexa” to the local microWakeWord detector on MIC1
+- Feedback: the LED lights and a beep plays, then the LED switches off
+- Question: begin within 1.5 seconds after the beep. A 1.5-second pause ends the question
+- Barge-in: say “Alexa” during an answer, wait for the beep, then ask the next question
 - Tools: calculator, time/date, weather, project information, and GeckoLink control
 - Startup: `/etc/init.d/S99zz-livekit-voice` starts the board client at boot
 
@@ -83,6 +85,10 @@ the LiveKit CLI. Cloud credentials must be configured as deployment secrets.
 
 ## Deploy the Luckfox client
 
+Install the microWakeWord runtime with the updated client.
+See [Alexa setup and recovery](docs/MICROWAKEWORD.md) for build, installation, and test commands.
+The runtime is a required dependency. The general deployment script does not install it.
+
 The tracked ARM client is:
 
 ```text
@@ -114,11 +120,11 @@ tail -f /root/luckfox-livekit.log
 ```
 
 Expected lines include `Connected to LiveKit room`, `Dispatched agent
-my-agent`, `Push button ready`, and `Receiving voice from agent`.
+my-agent`, `WAKE READY`, and `Receiving voice from agent`.
 
 ## Test
 
-Press the push button once, then ask near the board:
+Say “Alexa.” After the beep and LED switch off, ask near the board:
 
 ```text
 What time is it?
@@ -126,8 +132,9 @@ Turn on the living room ceiling light.
 ಲಿವಿಂಗ್ ರೂಮ್ ಲೈಟ್ ಆನ್ ಮಾಡಿ.
 ```
 
-Each independent question needs a button press. During a long answer, press
-the button again and ask the next question to stop the old reply.
+Each independent question needs “Alexa.” During a long answer, say “Alexa”
+again. After the beep, ask the next question.
+MIC1 stays open for local detection. Only question audio goes to the cloud.
 
 ## Logs
 
@@ -144,7 +151,7 @@ lk agent logs --id <cloud-agent-id> --project <project-name> --log-type deploy
 ```
 
 Cloud logs show `VOICE USER`, `VOICE ASSISTANT`, `VOICE STATE`, tool calls,
-button decisions, and Sarvam WebSocket status. Board logs do not contain
+wake-word decisions, and Sarvam WebSocket status. Board logs do not contain
 the complete speech transcript.
 
 ## GeckoLink voice control
